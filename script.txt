@@ -10,7 +10,10 @@ $ kmc_tools transform reads histogram reads.histo -cx10000
 
 *** hifiasm assembly (-l 0 to 3 for different purge levels)
 
-hifiasm -o Haden -t 12 -l 3 m64310e_230506_034722.hifi_reads.filt.fastq.gz 
+hifiasm -o Haden -t 12 -l 3 m64310e_230506_034722.hifi_reads.filt.fastq.gz --primary
+
+*** gfa to fa
+awk '/^S/{print ">"$2"\n"$3}' Haden.a_ctg.gfa | fold > Haden.a_ctg.fa 
 
 
 *** HiCanu Assembly
@@ -50,7 +53,7 @@ for i in {1..20}; do
   head -$((2 * i)) ragtag.scaffold.fasta | tail -2 > ./chr/ch$i
 done
 
-**** extract sequence containing 5'end telomere from fastq file
+**** extract sequence containing telomere from fastq file
 
 # Extract lines from FASTQ file
 grep -B 1 'AGGGTTTAGGGTTTAGGGTTTAGGGTTT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./AGGGTTT/AGGGTTT.fasta
@@ -63,5 +66,69 @@ blastn -query query.fasta -db AGGGTTT_db -out results.txt -outfmt 6 -evalue 1e-5
 
 **** extract specific sequence from fasta
 grep -A 1 "m64310e_230506_034722/132711129/ccs" AGGGTTT.fasta
+
+
+**** download sequence from SRA using SRA Toolkit
+
+bin/vdb-config -i
+
+bin/fastq-dump SRRXXXXXXX
+
+
+**** minimap2 alignment 
+
+# Align PacBio long reads to the reference genome
+minimap2 -ax map-pb -t 10 ./haden_modified.fasta /blue/xingbo.wu/jinli/mango/haden/haden_hicanu/m64310e_230506_034722.hifi_reads.fastq > aligned.sam
+
+# Convert SAM to BAM format
+samtools view -Sb aligned.sam > aligned.bam
+
+# Sort the BAM file
+samtools sort aligned.bam -o aligned.sorted.bam
+
+# Index the sorted BAM file
+samtools index aligned.sorted.bam
+
+*** to get paf
+
+minimap2 -x asm5 -c reference.fasta query.fasta > alignment.paf
+
+
+*** dot plot visualization with paft in R
+
+alignment <- read_paf("alignment.paf")
+
+dotplot(alignment, label_seqs=TRUE, order_by="qstart") + theme_bw()
+
+
+**** annotation
+
+*** repeatmodeler + repeatmasker
+
+# Set paths to your input files and output directories
+INPUT_GENOME="haden_modified.fasta"
+OUTPUT_DIR="Repeat_result"
+DB_NAME="mango_haden"
+
+# Step 1: Build the RepeatModeler database
+BuildDatabase -name $DB_NAME -engine ncbi $INPUT_GENOME
+
+# Step 2: Run RepeatModeler to build the custom repeat library
+RepeatModeler -pa 60 -database $DB_NAME -LTRStruct 
+
+# Step 3: Run RepeatMasker for masking small repeats
+RepeatMasker -pa 60 \
+-e rmblast -lib $DB_NAME-families.fa \
+-xsmall -gff -dir $OUTPUT_DIR $INPUT_GENOME
+
+*** edta repeats
+
+EDTA.pl --genome haden_modified.fasta --sensitive 1 --anno 1 --evaluate 1 --threads 60 --force 1
+
+*** funannotate 
+
+*** BRAKER 3
+
+
 
 
