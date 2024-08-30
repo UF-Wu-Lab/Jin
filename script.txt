@@ -56,7 +56,8 @@ done
 **** extract sequence containing telomere from fastq file
 
 # Extract lines from FASTQ file
-grep -B 1 'AGGGTTTAGGGTTTAGGGTTTAGGGTTT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./AGGGTTT/AGGGTTT.fasta
+grep -B 1 'AGGGTTTAGGGTTTAGGGTTTAGGGTTT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./AGGGTTT.fasta
+grep -B 1 'AAACCCTAAACCCTAAACCCTAAACCCT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./AAACCCT.fasta
 
 
 **** blast
@@ -125,10 +126,83 @@ RepeatMasker -pa 60 \
 
 EDTA.pl --genome haden_modified.fasta --sensitive 1 --anno 1 --evaluate 1 --threads 60 --force 1
 
-*** funannotate 
+** (try) -hardmask 0
+
+** softmask 
+
+RepeatMasker -pa 8 -lib haden_modified.fasta.mod.EDTA.TElib.fa -xsmall -dir ./softmask haden_modified.fasta
+
+** alternate
+
+conda create -n EDTA
+conda activate EDTA
+git clone https://github.com/oushujun/EDTA.git
+
+perl ./EDTA/util/make_masked.pl -genome /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/haden_modified.fasta -minlen 80 -hardmask 0 -t 2 -rmout /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/haden_modified.fasta.mod.EDTA.anno/haden_modified.fasta.mod.EDTA.TEanno.out 
+
+*** funannotate (failed) 
+
+funannotate predict -i genome.fasta --species "Mango haden" --maker_gff my_previous_maker.gff
 
 *** BRAKER 3
 
+module load braker/3.0.8
+
+export
+AUGUSTUS_CONFIG_PATH=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/config
+
+braker.pl --genome=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked --prot_seq=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/funannotate/GWHEQCT00000000.Protein.faa --threads=$SLURM_CPUS_PER_TASK
+
+** merge chr.fasta to genome.fasta
+
+cat chr1.fasta chr2.fasta chr3.fasta chr4.fasta chr5.fasta chr6.fasta chr7.fasta chr8.fasta chr9.fasta chr10.fasta chr11.fasta chr12.fasta chr13.fasta chr14.fasta chr15.fasta chr16.fasta chr17.fasta chr18.fasta chr19.fasta chr20.fasta > combined.fasta
 
 
+
+
+** rename chromosome name 
+
+sed -i 's/>GWHEQCT00000001_RagTag/>Haden_Chr1/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000002_RagTag/>Haden_Chr2/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000003_RagTag/>Haden_Chr3/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000004_RagTag/>Haden_Chr4/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000005_RagTag/>Haden_Chr5/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000006_RagTag/>Haden_Chr6/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000007_RagTag/>Haden_Chr7/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000008_RagTag/>Haden_Chr8/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000009_RagTag/>Haden_Chr9/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000010_RagTag/>Haden_Chr10/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000011_RagTag/>Haden_Chr11/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000012_RagTag/>Haden_Chr12/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000013_RagTag/>Haden_Chr13/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000014_RagTag/>Haden_Chr14/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000015_RagTag/>Haden_Chr15/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000016_RagTag/>Haden_Chr16/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000017_RagTag/>Haden_Chr17/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000018_RagTag/>Haden_Chr18/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000019_RagTag/>Haden_Chr19/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000020_RagTag/>Haden_Chr20/' haden_modified.fasta.masked
+
+
+
+**** agat_sq_stat_basic.pl gtf summary
+
+module load agat
+
+$ssembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked -o mango_haden_gtf_agat_summary
+
+
+**** busco 
+
+** list all databases
+
+busco --list-datasets
+
+** run busco on protein fasta
+
+busco -i /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/braker/braker.aa -l embryophyta_odb10 -o busco_output -m protein
+
+**** quast
+
+quast -o quast_output /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked
 
