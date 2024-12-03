@@ -1,0 +1,112 @@
+Impatiens
+
+**** Quality Control (FastQC)
+
+# Load FastQC module (if installed as a module on your HPC)
+module load fastqc/0.12.1
+
+# Create output directory
+mkdir -p fastqc_output
+
+# Define input fastq files
+input_files="/blue/xingbo.wu/share/impatiens/213B_Wu_R1/Impatiens_S3_L003_R1_001.fastq.gz /blue/xingbo.wu/share/impatiens/213B_Wu_R2/Impatiens_S3_L003_R2_001.fastq.gz"
+
+# Run FastQC on all input files
+fastqc $input_files --outdir=fastqc_output --threads 10
+
+
+**** Mapping Hi-C Reads to the Genome Assembly
+
+#!/bin/bash
+#SBATCH --job-name=hic_mapping
+#SBATCH --qos=xingbo.wu-b 
+#SBATCH --ntasks=1
+#SBATCH --mem=100G
+#SBATCH --time=23:00:00
+#SBATCH --cpus-per-task=14
+
+
+# Load required modules
+module load bwa
+module load samtools
+
+# Set paths to your input files and output directory
+reference_genome="/blue/xingbo.wu/share/impatiens/impatiens/impatiens.p_ctg.fa"
+R1="/blue/xingbo.wu/share/impatiens/213B_Wu_R1/Impatiens_S3_L003_R1_001.fastq.gz"
+R2="/blue/xingbo.wu/share/impatiens/213B_Wu_R2/Impatiens_S3_L003_R2_001.fastq.gz"
+output_dir="/blue/xingbo.wu/jinli/impatiens"
+
+# Step 1: Index the reference genome
+echo "Indexing reference genome..."
+bwa index $reference_genome || { echo "BWA index failed"; exit 1; }
+
+# Step 2: Map Hi-C reads to the reference genome
+aligned_sam="$output_dir/hic_aligned.sam"
+echo "Mapping reads to reference genome..."
+bwa mem -t 16 $reference_genome $R1 $R2 > $aligned_sam || { echo "BWA mem failed"; exit 1; }
+
+# Step 3: Convert SAM to BAM
+aligned_bam="$output_dir/hic_aligned.bam"
+echo "Converting SAM to BAM..."
+samtools view -Sb $aligned_sam > $aligned_bam || { echo "SAM to BAM conversion failed"; exit 1; }
+
+# Step 4: Sort the BAM file
+sorted_bam="$output_dir/hic_aligned_sorted.bam"
+echo "Sorting BAM file..."
+samtools sort -@ 16 -o $sorted_bam $aligned_bam || { echo "BAM sorting failed"; exit 1; }
+
+# Step 5: Mark duplicates
+marked_duplicates_bam="$output_dir/hic_aligned_sorted_dedup.bam"
+echo "Marking duplicates..."
+samtools markdup -@ 16 $sorted_bam $marked_duplicates_bam || { echo "Duplicate marking failed"; exit 1; }
+
+# Step 6: Index the final BAM file for downstream analysis
+echo "Indexing final BAM file..."
+samtools index $marked_duplicates_bam || { echo "BAM indexing failed"; exit 1; }
+
+# Clean up intermediate files
+echo "Cleaning up intermediate files..."
+rm $aligned_sam $aligned_bam $sorted_bam
+
+echo "Hi-C mapping completed successfully."
+
+**** salsa
+
+module load salsa/20220408
+module load bedtools
+
+bedtools bamtobed -i /orange/xingbo.wu/jinli/impatiens/hic_aligned_sorted_dedup.bam  > /orange/xingbo.wu/jinli/impatiens/hic_aligned_sorted_dedup.bed
+
+/apps/salsa/20220408/SALSA/bin/run_pipeline.py \
+-a /blue/xingbo.wu/jinli/impatiens/impatiens.p_ctg.fa \
+-l 150 \
+-b /orange/xingbo.wu/jinli/impatiens/hic_aligned_sorted_dedup.bed \
+-o salsa_output \
+-x 64
+
+
+**** Juicer
+
+*** Create a chromosome sizes file in the format “name\tsequence_length”
+
+samtools faidx samtools faidx impatiens.p_ctg.fa
+
+cut -f 1,2 impatiens.p_ctg.fa.fai > juicer/chrom.sizes
+
+*** split fastq to short fragments
+
+split -a 3 -l 90000000 -d --additional-suffix=_R1.fastq ../fastq/Impatiens_S3_L003_R1_001.fastq
+split -a 3 -l 90000000 -d --additional-suffix=_R2.fastq ../fastq/Impatiens_S3_L003_R2_001.fastq
+
+
+
+
+
+
+**** other
+
+*** check group resources 
+
+sacctmgr show qos xingbo.wu format="Name%-16,GrpSubmit,MaxWall,GrpTres%-45"
+
+

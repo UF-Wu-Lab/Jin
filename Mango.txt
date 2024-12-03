@@ -1,0 +1,1140 @@
+*** k-mer analysis 
+
+module load kmc/3.2.1  
+$ mkdir tmp
+$ ls *.fastq > FILES
+$ kmc -k21 -t10 -m64 -ci1 -cs10000 @FILES reads tmp/
+
+$ kmc_tools transform reads histogram reads.histo -cx10000
+
+
+*** hifiasm assembly (-l 0 to 3 for different purge levels)
+
+hifiasm -o Haden -t 12 -l 3 m64310e_230506_034722.hifi_reads.filt.fastq.gz --primary
+
+*** gfa to fa
+awk '/^S/{print ">"$2"\n"$3}' Haden.a_ctg.gfa | fold > Haden.a_ctg.fa 
+
+
+*** HiCanu Assembly
+
+canu -p mango -d haden_hifi genomeSize=350m -pacbio-hifi /blue/xingbo.wu/share/mango/Haden/m64310e_230506_034722.hifi_reads.filt.fastq.gz
+
+*** convert gfa to fasta (-w line width)
+
+awk '/^S/ {print ">"$2"\n"$3}' hifiasm.asm.bp.p_ctg.gfa | seqkit seq -w 60 > Haden.hifi_assembled.fasta
+
+*** ragtag scaffolding
+
+ragtag.py scaffold <reference_genome.fasta> Haden.p_ctg.fa -o Haden_assembly -t 12 
+
+
+*** A Telomere Identification toolKit (tidk)
+
+conda create -n tidk_env -c bioconda tidk
+
+conda activate tidk_env
+
+tidk search --string AAACCCT --output tidk_output --dir ./ ragtag.scaffold.fasta
+
+** plot
+tidk plot --tsv tidk_output_telomeric_repeat_windows.tsv
+
+
+**** get chr form ragtag.scaffold.fasta
+
+#!/bin/bash
+
+# Create the ./chr directory if it doesn't exist
+mkdir -p ./chr
+
+# Loop through chromosome numbers 1 to 20
+for i in {1..20}; do
+  head -$((2 * i)) ragtag.scaffold.fasta | tail -2 > ./chr/ch$i
+done
+
+**** extract sequence containing telomere from fastq file
+
+# Extract lines from FASTQ file
+grep -B 1 'AGGGTTTAGGGTTTAGGGTTTAGGGTTT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./gggttta/AGGGTTT.fasta
+grep -B 1 'AAACCCTAAACCCTAAACCCTAAACCCT' m64310e_230506_034722.hifi_reads.fastq | sed 's/@/>/g' > ./aaaccct/AAACCCT.fasta
+
+
+**** blast
+conda activate blast
+makeblastdb -in AGGGTTT.fasta -dbtype nucl -out AGGGTTT_db
+blastn -query query.fasta -db AGGGTTT_db -out results.txt -outfmt 6 -evalue 1e-5 -max_target_seqs 10 -num_threads 4
+
+**** extract specific sequence from fasta
+grep -A 1 "m64310e_230506_034722/132711129/ccs" AGGGTTT.fasta
+
+
+**** download sequence from SRA using SRA Toolkit
+
+bin/vdb-config -i
+
+bin/fastq-dump SRRXXXXXXX
+
+
+**** minimap2 alignment 
+
+# Align PacBio long reads to the reference genome
+minimap2 -ax map-pb -t 10 ./haden_modified.fasta /blue/xingbo.wu/jinli/mango/haden/haden_hicanu/m64310e_230506_034722.hifi_reads.fastq > aligned.sam
+
+# Convert SAM to BAM format
+samtools view -Sb aligned.sam > aligned.bam
+
+# Sort the BAM file
+samtools sort aligned.bam -o aligned.sorted.bam
+
+# Index the sorted BAM file
+samtools index aligned.sorted.bam
+
+*** to get paf
+
+minimap2 -x asm5 -c reference.fasta query.fasta > alignment.paf
+
+
+*** dot plot visualization with paft in R
+
+alignment <- read_paf( system.file("extdata", "fungi.paf", package="pafr") )
+
+dotplot(alignment, label_seqs=TRUE, order_by="qstart") + theme_bw()
+
+
+*** D-Genies big genome alignment
+
+**** annotation
+
+*** repeatmodeler + repeatmasker
+
+# Set paths to your input fil	es and output directories
+INPUT_GENOME="haden_modified.fasta"
+OUTPUT_DIR="Repeat_result"
+DB_NAME="mango_haden"
+
+# Step 1: Build the RepeatModeler database
+BuildDatabase -name $DB_NAME -engine ncbi $INPUT_GENOME
+
+# Step 2: Run RepeatModeler to build the custom repeat library
+RepeatModeler -pa 60 -database $DB_NAME -LTRStruct 
+
+# Step 3: Run RepeatMasker for masking small repeats
+RepeatMasker -pa 60 \
+-e rmblast -lib $DB_NAME-families.fa \
+-xsmall -gff -dir $OUTPUT_DIR $INPUT_GENOME
+
+*** edta repeats
+
+EDTA.pl --genome haden_modified.fasta --sensitive 1 --anno 1 --evaluate 1 --threads 60 --force 1
+
+** (try) -hardmask 0
+
+** softmask 
+
+RepeatMasker -pa 8 -lib haden_modified.fasta.mod.EDTA.TElib.fa -xsmall -dir ./softmask haden_modified.fasta
+
+** alternate
+
+conda create -n EDTA
+conda activate EDTA
+git clone https://github.com/oushujun/EDTA.git
+
+perl ./EDTA/util/make_masked.pl -genome /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/haden_modified.fasta -minlen 80 -hardmask 0 -t 2 -rmout /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/haden_modified.fasta.mod.EDTA.anno/haden_modified.fasta.mod.EDTA.TEanno.out 
+
+*** funannotate (failed) 
+
+funannotate predict -i genome.fasta --species "Mango haden" --maker_gff my_previous_maker.gff
+
+*** BRAKER 3
+
+module load braker/3.0.8
+
+export
+AUGUSTUS_CONFIG_PATH=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/config
+
+braker.pl --genome=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked --prot_seq=/blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/edta/funannotate/GWHEQCT00000000.Protein.faa --threads=$SLURM_CPUS_PER_TASK
+
+** merge chr.fasta to genome.fasta
+
+cat chr1.fasta chr2.fasta chr3.fasta chr4.fasta chr5.fasta chr6.fasta chr7.fasta chr8.fasta chr9.fasta chr10.fasta chr11.fasta chr12.fasta chr13.fasta chr14.fasta chr15.fasta chr16.fasta chr17.fasta chr18.fasta chr19.fasta chr20.fasta > combined.fasta
+
+
+
+
+** rename chromosome name 
+
+sed -i 's/>GWHEQCT00000001_RagTag/>Haden_Chr1/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000002_RagTag/>Haden_Chr2/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000003_RagTag/>Haden_Chr3/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000004_RagTag/>Haden_Chr4/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000005_RagTag/>Haden_Chr5/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000006_RagTag/>Haden_Chr6/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000007_RagTag/>Haden_Chr7/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000008_RagTag/>Haden_Chr8/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000009_RagTag/>Haden_Chr9/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000010_RagTag/>Haden_Chr10/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000011_RagTag/>Haden_Chr11/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000012_RagTag/>Haden_Chr12/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000013_RagTag/>Haden_Chr13/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000014_RagTag/>Haden_Chr14/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000015_RagTag/>Haden_Chr15/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000016_RagTag/>Haden_Chr16/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000017_RagTag/>Haden_Chr17/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000018_RagTag/>Haden_Chr18/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000019_RagTag/>Haden_Chr19/' haden_modified.fasta.masked
+sed -i 's/>GWHEQCT00000020_RagTag/>Haden_Chr20/' haden_modified.fasta.masked
+
+
+
+**** agat_sq_stat_basic.pl gtf summary
+
+module load agat
+
+$ssembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked -o mango_haden_gtf_agat_summary
+
+
+**** busco 
+
+** list all databases
+
+busco --list-datasets
+
+** run busco on protein fasta
+
+busco -i /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/braker/braker.aa -l embryophyta_odb10 -o busco_output -m protein
+
+**** quast
+
+quast -o quast_output /blue/xingbo.wu/jinli/mango/haden/Solved_chr/primary_assembly/repeatmodeler/Repeat_result/braker3/haden_modified.fasta.masked
+
+
+**** plotsr generates high-quality visualisation of synteny and structural rearrangements between multiple genomes
+
+*** alignment 
+
+# Load the required modules
+module load minimap2
+module load samtools
+
+# Step 1: Align irwin.genome.fasta to haden.genome.fasta
+echo "Aligning irwin.genome.fasta to haden.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx irwin.genome.fasta haden.genome.fasta | samtools sort -O BAM - > alignment/irwin_haden.bam
+samtools index alignment/irwin_haden.bam
+
+# Step 2: Align haden.genome.fasta to xiangyahong.genome.fasta
+echo "Aligning haden.genome.fasta to xiangyahong.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx haden.genome.fasta xiangyahong.genome.fasta | samtools sort -O BAM - > alignment/haden_xiangyahong.bam
+samtools index alignment/haden_xiangyahong.bam
+
+# Step 3: Align xiangyahong.genome.fasta to odorata.genome.fasta
+echo "Aligning xiangyahong.genome.fasta to odorata.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx xiangyahong.genome.fasta odorata.genome.fasta | samtools sort -O BAM - > alignment/xiangyahong_odorata.bam
+samtools index alignment/xiangyahong_odorata.bam
+
+# Step 4: Align odorata.genome.fasta to carabao.genome.fasta
+echo "Aligning odorata.genome.fasta to carabao.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx odorata.genome.fasta carabao.genome.fasta | samtools sort -O BAM - > alignment/odorata_carabao.bam
+samtools index alignment/odorata_carabao.bam
+
+# Step 5: Align carabao.genome.fasta to alampur.genome.fasta
+echo "Aligning carabao.genome.fasta to alampur.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx carabao.genome.fasta alampur.genome.fasta | samtools sort -O BAM - > alignment/carabao_alampur.bam
+samtools index alignment/carabao_alampur.bam
+
+# Step 6: Align alampur.genome.fasta to safeda.genome.fasta
+echo "Aligning alampur.genome.fasta to safeda.genome.fasta..."
+minimap2 -ax asm5 -t 14 --eqx alampur.genome.fasta safeda.genome.fasta | samtools sort -O BAM - > alignment/alampur_safeda.bam
+samtools index alignment/alampur_safeda.bam
+
+echo "All alignments are complete!"
+
+
+*** syri finding structural annotations between genomes
+
+# Load the required modules
+module load syri/1.5.4
+
+# Running syri for finding structural rearrangements between irwin and haden
+syri -c irwin_haden.bam -r irwin.genome.fasta -q haden.genome.fasta -F B --prefix syri/irwin_haden &
+
+# Running syri for finding structural rearrangements between haden and xiangyahong
+syri -c haden_xiangyahong.bam -r haden.genome.fasta -q xiangyahong.genome.fasta -F B --prefix syri/haden_xiangyahong &
+
+# Running syri for finding structural rearrangements between xiangyahong and odorata
+syri -c xiangyahong_odorata.bam -r xiangyahong.genome.fasta -q odorata.genome.fasta -F B --prefix syri/xiangyahong_odorata &
+
+# Running syri for finding structural rearrangements between odorata and carabao
+syri -c odorata_carabao.bam -r odorata.genome.fasta -q carabao.genome.fasta -F B --prefix syri/odorata_carabao &
+
+# Running syri for finding structural rearrangements between carabao and alampur
+syri -c carabao_alampur.bam -r carabao.genome.fasta -q alampur.genome.fasta -F B --prefix syri/carabao_alampur &
+
+# Running syri for finding structural rearrangements between alampur and safeda
+syri -c alampur_safeda.bam -r alampur.genome.fasta -q safeda.genome.fasta -F B --prefix syri/alampur_safeda &
+
+*** sort syri output according to chr number
+
+sort -V -k1,1 haden_odoratasyri.out > haden_odoratasyri_sorted.out
+
+*** Running plotsr for visualization 
+
+plotsr \
+    --sr ../irwin_hadensyri.out \
+    --sr ../haden_odoratasyri.out \
+    --sr ../odorata_carabaosyri.out \
+    --sr ../carabao_alampursyri.out \
+    --sr ../alampur_safedasyri.out \
+    --genomes genomes.txt \
+    -o mango_pangenome_plot.png
+
+
+*** genomes.txt file
+
+#file	name	tags
+irwin.genome.fasta	Irwin	lw:1.5
+haden.genome.fasta	Haden	lw:1.5
+odorata.genome.fasta	Odorata	lw:1.5
+carabao.genome.fasta	Carabao	lw:1.5
+alampur.genome.fasta	Alampur	lw:1.5
+safeda.genome.fasta	Safeda	lw:1.5
+
+
+**** OrthoFinder
+
+*** edit protein.aa sequence name to include accession name
+
+sed -i 's/>g/>alampur_g/' alampur.aa 
+
+*** Extract Longest Isoform from Protein FASTA
+
+cd-hit -i input_protein_sequences.fasta -o longest_isoforms.fasta -c 0.99 -n 5
+
+*** orthofinder 
+
+mkdir mango_orthofinder
+
+cp mango_accession*_longest_isoforms.fasta mango_orthofinder/
+
+orthofinder -f mango_orthofinder -t 8
+
+
+**** Venn Diagram (if five groups)
+
+# Load the VennDiagram library
+library(VennDiagram)
+
+# Read the data from the Orthogroups.txt file (assuming it's tab-delimited)
+data <- read.table("Orthogroups.venn.txt", header = TRUE, row.names = 1, sep = "\t")
+
+# Define professional colors for each category
+category_colors <- c(
+    "alampur"  = "#66CCFF",  # Blue for Alampur
+    "carabao"  = "#ff7f0e",  # Orange for Carabao
+    "haden"    = "#2ca02c",  # Green for Haden
+    "odorata"  = "#9467bd",  # Purple for Odorata
+    "safeda"   = "#d62728"   # Red for Safeda
+)
+
+
+
+# Create the Venn diagram
+venn.plot <- venn.diagram(
+    x = list(
+        "alampur"  = rownames(data[data$alampur == 1, ]),
+        "carabao"  = rownames(data[data$carabao == 1, ]),
+        "haden"    = rownames(data[data$haden == 1, ]),
+        "odorata"  = rownames(data[data$odorata == 1, ]),
+        "safeda"   = rownames(data[data$safeda == 1, ])
+    ),
+    category.names = c("Alampur", "Carabao", "Haden", "Odorata", "Safeda"),  # Full label names
+    filename = NULL,  # Use NULL to display the diagram in R
+    fill = category_colors,  # Use the category_colors vector for fill
+    cex = 1.5,
+    cat.cex = 1.5,  # Adjust the font size for category labels
+    cat.fontface = "bold",  # Make the category labels bold
+    margin = 0.1  # Add margin for category names
+)
+
+# Display the Venn diagram
+grid.draw(venn.plot)
+
+# Save the Venn diagram as a high-resolution TIFF image
+tiff("venn_diagram.tiff", width = 15, height = 15, units = "in", res = 450)
+
+# Display the Venn diagram in the TIFF file
+grid.draw(venn.plot)
+
+# Close the TIFF file
+dev.off()
+
+**** Venn Diagram (manually calculate the number) 
+
+*** In file Orthogroups.GeneCount.tsv, change all none zero number to 1
+
+awk 'NR==1 {print; next} {for (i=2; i<=NF; i++) if ($i != 0 && i > 1) $i=1; print}' Orthogroups.GeneCount.tsv > Orthogroups.venn.txt
+
+*** calculate number of unique orthogroup in each accession
+
+awk 'NR>1 && $2==1 {count=1; for(i=3;i<=NF;i++) if($i!=0) count=0; if(count) total++} END {print total}' Orthogroups.venn.txt
+
+*** one code for all
+
+awk '
+BEGIN {
+    # Initialize counts for each accession
+    count_alampur = 0;
+    count_carabao = 0;
+    count_haden = 0;
+    count_irwin = 0;
+    count_odorata = 0;
+    count_safeda = 0;
+
+    # Initialize counts for combinations
+    count_ac = 0;   # alampur, carabao
+    count_ah = 0;   # alampur, haden
+    count_ai = 0;   # alampur, irwin
+    count_ao = 0;   # alampur, odorata
+    count_as = 0;   # alampur, safeda
+    count_ch = 0;   # carabao, haden
+    count_ci = 0;   # carabao, irwin
+    count_co = 0;   # carabao, odorata
+    count_cs = 0;   # carabao, safeda
+    count_hi = 0;   # haden, irwin
+    count_ho = 0;   # haden, odorata
+    count_hs = 0;   # haden, safeda
+    count_ii = 0;   # irwin, odorata
+    count_is = 0;   # irwin, safeda
+    count_os = 0;   # odorata, safeda
+}
+
+# Count unique orthogroups for each accession
+NR > 1 {
+    # Count for alampur
+    if ($2 == 1 && $3 == 0 && $4 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_alampur++;
+    
+    # Count for carabao
+    if ($3 == 1 && $2 == 0 && $4 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_carabao++;
+    
+    # Count for haden
+    if ($4 == 1 && $2 == 0 && $3 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_haden++;
+    
+    # Count for irwin
+    if ($5 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $6 == 0 && $7 == 0) count_irwin++;
+    
+    # Count for odorata
+    if ($6 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $5 == 0 && $7 == 0) count_odorata++;
+    
+    # Count for safeda
+    if ($7 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $5 == 0 && $6 == 0) count_safeda++;
+
+    # Count for combinations
+    if ($2 == 1 && $3 == 1 && $4 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_ac++;
+    if ($2 == 1 && $4 == 1 && $3 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_ah++;
+    if ($2 == 1 && $5 == 1 && $3 == 0 && $4 == 0 && $6 == 0 && $7 == 0) count_ai++;
+    if ($2 == 1 && $6 == 1 && $3 == 0 && $4 == 0 && $5 == 0 && $7 == 0) count_ao++;
+    if ($2 == 1 && $7 == 1 && $3 == 0 && $4 == 0 && $5 == 0 && $6 == 0) count_as++;
+    
+    if ($3 == 1 && $4 == 1 && $2 == 0 && $5 == 0 && $6 == 0 && $7 == 0) count_ch++;
+    if ($3 == 1 && $5 == 1 && $2 == 0 && $4 == 0 && $6 == 0 && $7 == 0) count_ci++;
+    if ($3 == 1 && $6 == 1 && $2 == 0 && $4 == 0 && $5 == 0 && $7 == 0) count_co++;
+    if ($3 == 1 && $7 == 1 && $2 == 0 && $4 == 0 && $5 == 0 && $6 == 0) count_cs++;
+    
+    if ($4 == 1 && $5 == 1 && $2 == 0 && $3 == 0 && $6 == 0 && $7 == 0) count_hi++;
+    if ($4 == 1 && $6 == 1 && $2 == 0 && $3 == 0 && $5 == 0 && $7 == 0) count_ho++;
+    if ($4 == 1 && $7 == 1 && $2 == 0 && $3 == 0 && $5 == 0 && $6 == 0) count_hs++;
+    
+    if ($5 == 1 && $6 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $7 == 0) count_ii++;
+    if ($5 == 1 && $7 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $6 == 0) count_is++;
+    
+    if ($6 == 1 && $7 == 1 && $2 == 0 && $3 == 0 && $4 == 0 && $5 == 0) count_os++;
+}
+
+END {
+    # Output the results to the specified file
+    print "Unique Orthogroups Count:" > "unique_orthogroup_count.txt";
+    print "alampur: " count_alampur >> "unique_orthogroup_count.txt";
+    print "carabao: " count_carabao >> "unique_orthogroup_count.txt";
+    print "haden: " count_haden >> "unique_orthogroup_count.txt";
+    print "irwin: " count_irwin >> "unique_orthogroup_count.txt";
+    print "odorata: " count_odorata >> "unique_orthogroup_count.txt";
+    print "safeda: " count_safeda >> "unique_orthogroup_count.txt";
+    
+    print "\nUnique Orthogroups Count for Combinations:" >> "unique_orthogroup_count.txt";
+    print "alampur & carabao: " count_ac >> "unique_orthogroup_count.txt";
+    print "alampur & haden: " count_ah >> "unique_orthogroup_count.txt";
+    print "alampur & irwin: " count_ai >> "unique_orthogroup_count.txt";
+    print "alampur & odorata: " count_ao >> "unique_orthogroup_count.txt";
+    print "alampur & safeda: " count_as >> "unique_orthogroup_count.txt";
+    
+    print "carabao & haden: " count_ch >> "unique_orthogroup_count.txt";
+    print "carabao & irwin: " count_ci >> "unique_orthogroup_count.txt";
+    print "carabao & odorata: " count_co >> "unique_orthogroup_count.txt";
+    print "carabao & safeda: " count_cs >> "unique_orthogroup_count.txt";
+    
+    print "haden & irwin: " count_hi >> "unique_orthogroup_count.txt";
+    print "haden & odorata: " count_ho >> "unique_orthogroup_count.txt";
+    print "haden & safeda: " count_hs >> "unique_orthogroup_count.txt";
+    
+    print "irwin & odorata: " count_ii >> "unique_orthogroup_count.txt";
+    print "irwin & safeda: " count_is >> "unique_orthogroup_count.txt";
+    
+    print "odorata & safeda: " count_os >> "unique_orthogroup_count.txt";
+}
+' Orthogroups.venn.txt
+
+
+
+*** calculate relationship between the number of core genes and the number of species
+
+#!/bin/bash
+
+# Define input and output files
+INPUT_FILE="Orthogroups.GeneCount.tsv"
+OUTPUT_FILE="core_pan.txt"
+
+# Clear previous output
+> "$OUTPUT_FILE"
+
+# Use AWK to process the input file
+awk '
+BEGIN {
+    # Print header to the output file
+    print "Unique Orthogroup Counts for Each Accession and Combinations" > "'$OUTPUT_FILE'"
+}
+
+{
+    # Initialize counts for accessions and combinations
+    if (NR > 1) {
+        alampur = $2; carabao = $3; haden = $4; irwin = $5; odorata = $6; safeda = $7;
+
+        # Count unique orthogroups for each accession
+        if (alampur > 0 && carabao == 0 && haden == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_alampur++;
+        if (carabao > 0 && alampur == 0 && haden == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_carabao++;
+        if (haden > 0 && alampur == 0 && carabao == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_haden++;
+        if (irwin > 0 && alampur == 0 && carabao == 0 && haden == 0 && odorata == 0 && safeda == 0) count_irwin++;
+        if (odorata > 0 && alampur == 0 && carabao == 0 && haden == 0 && irwin == 0 && safeda == 0) count_odorata++;
+        if (safeda > 0 && alampur == 0 && carabao == 0 && haden == 0 && irwin == 0 && odorata == 0) count_safeda++;
+
+        # Count unique orthogroups for combinations of 2 accessions (15 ways)
+        if (alampur > 0 && carabao > 0 && haden == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_ac++;
+        if (alampur > 0 && haden > 0 && carabao == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_ah++;
+        if (alampur > 0 && irwin > 0 && carabao == 0 && haden == 0 && odorata == 0 && safeda == 0) count_ai++;
+        if (alampur > 0 && odorata > 0 && carabao == 0 && haden == 0 && irwin == 0 && safeda == 0) count_ao++;
+        if (alampur > 0 && safeda > 0 && carabao == 0 && haden == 0 && irwin == 0 && odorata == 0) count_as++;
+        if (carabao > 0 && haden > 0 && alampur == 0 && irwin == 0 && odorata == 0 && safeda == 0) count_ch++;
+        if (carabao > 0 && irwin > 0 && alampur == 0 && haden == 0 && odorata == 0 && safeda == 0) count_ci++;
+        if (carabao > 0 && odorata > 0 && alampur == 0 && haden == 0 && irwin == 0 && safeda == 0) count_co++;
+        if (carabao > 0 && safeda > 0 && alampur == 0 && haden == 0 && irwin == 0 && odorata == 0) count_cs++;
+        if (haden > 0 && irwin > 0 && alampur == 0 && carabao == 0 && odorata == 0 && safeda == 0) count_hi++;
+        if (haden > 0 && odorata > 0 && alampur == 0 && carabao == 0 && irwin == 0 && safeda == 0) count_ho++;
+        if (haden > 0 && safeda > 0 && alampur == 0 && carabao == 0 && irwin == 0 && odorata == 0) count_hs++;
+        if (irwin > 0 && odorata > 0 && alampur == 0 && carabao == 0 && haden == 0 && safeda == 0) count_io++;
+        if (irwin > 0 && safeda > 0 && alampur == 0 && carabao == 0 && haden == 0 && odorata == 0) count_is++;
+        if (odorata > 0 && safeda > 0 && alampur == 0 && carabao == 0 && haden == 0 && irwin == 0) count_os++;
+
+        # Count unique orthogroups for combinations of 3 accessions (20 ways)
+        if (alampur > 0 && carabao > 0 && haden > 0 && irwin == 0 && odorata == 0 && safeda == 0) count_ach++;
+        if (alampur > 0 && carabao > 0 && irwin > 0 && haden == 0 && odorata == 0 && safeda == 0) count_aci++;
+        if (alampur > 0 && carabao > 0 && odorata > 0 && haden == 0 && irwin == 0 && safeda == 0) count_aco++;
+        if (alampur > 0 && carabao > 0 && safeda > 0 && haden == 0 && irwin == 0 && odorata == 0) count_acs++;
+        if (alampur > 0 && haden > 0 && irwin > 0 && carabao == 0 && odorata == 0 && safeda == 0) count_ahi++;
+        if (alampur > 0 && haden > 0 && odorata > 0 && carabao == 0 && irwin == 0 && safeda == 0) count_aho++;
+        if (alampur > 0 && haden > 0 && safeda > 0 && carabao == 0 && irwin == 0 && odorata == 0) count_ahs++;
+        if (alampur > 0 && irwin > 0 && odorata > 0 && carabao == 0 && haden == 0 && safeda == 0) count_aio++;
+        if (alampur > 0 && irwin > 0 && safeda > 0 && carabao == 0 && haden == 0 && odorata == 0) count_ais++;
+        if (alampur > 0 && odorata > 0 && safeda > 0 && carabao == 0 && haden == 0 && irwin == 0) count_aos++;
+        if (carabao > 0 && haden > 0 && irwin > 0 && alampur == 0 && odorata == 0 && safeda == 0) count_chi++;
+        if (carabao > 0 && haden > 0 && odorata > 0 && alampur == 0 && irwin == 0 && safeda == 0) count_cho++;
+        if (carabao > 0 && haden > 0 && safeda > 0 && alampur == 0 && irwin == 0 && odorata == 0) count_chs++;
+        if (carabao > 0 && irwin > 0 && odorata > 0 && alampur == 0 && haden == 0 && safeda == 0) count_cio++;
+        if (carabao > 0 && irwin > 0 && safeda > 0 && alampur == 0 && haden == 0 && odorata == 0) count_cis++;
+        if (carabao > 0 && odorata > 0 && safeda > 0 && alampur == 0 && haden == 0 && irwin == 0) count_cos++;
+        if (haden > 0 && irwin > 0 && odorata > 0 && alampur == 0 && carabao == 0 && safeda == 0) count_hio++;
+        if (haden > 0 && irwin > 0 && safeda > 0 && alampur == 0 && carabao == 0 && odorata == 0) count_his++;
+        if (haden > 0 && odorata > 0 && safeda > 0 && alampur == 0 && carabao == 0 && irwin == 0) count_hos++;
+        if (irwin > 0 && odorata > 0 && safeda > 0 && alampur == 0 && carabao == 0 && haden == 0) count_ios++;
+
+        # Count unique orthogroups for combinations of 4 accessions (15 ways)
+        if (alampur > 0 && carabao > 0 && haden > 0 && irwin > 0 && odorata == 0 && safeda == 0) count_achi++;
+        if (alampur > 0 && carabao > 0 && haden > 0 && odorata > 0 && irwin == 0 && safeda == 0) count_acho++;
+        if (alampur > 0 && carabao > 0 && haden > 0 && safeda > 0 && irwin == 0 && odorata == 0) count_achs++;
+        if (alampur > 0 && carabao > 0 && irwin > 0 && odorata > 0 && haden == 0 && safeda == 0) count_acio++;
+        if (alampur > 0 && carabao > 0 && irwin > 0 && safeda > 0 && haden == 0 && odorata == 0) count_acis++;
+        if (alampur > 0 && carabao > 0 && odorata > 0 && safeda > 0 && haden == 0 && irwin == 0) count_acos++;
+        if (alampur > 0 && haden > 0 && irwin > 0 && odorata > 0 && carabao == 0 && safeda == 0) count_ahio++;
+        if (alampur > 0 && haden > 0 && irwin > 0 && safeda > 0 && carabao == 0 && odorata == 0) count_ahis++;
+        if (alampur > 0 && haden > 0 && odorata > 0 && safeda > 0 && carabao == 0 && irwin == 0) count_ahos++;
+        if (alampur > 0 && irwin > 0 && odorata > 0 && safeda > 0 && carabao == 0 && haden == 0) count_aios++;
+        if (carabao > 0 && haden > 0 && irwin > 0 && odorata > 0 && alampur == 0 && safeda == 0) count_chio++;
+        if (carabao > 0 && haden > 0 && irwin > 0 && safeda > 0 && alampur == 0 && odorata == 0) count_chis++;
+        if (carabao > 0 && haden > 0 && odorata > 0 && safeda > 0 && alampur == 0 && irwin == 0) count_chos++;
+        if (carabao > 0 && irwin > 0 && odorata > 0 && safeda > 0 && alampur == 0 && haden == 0) count_cios++;
+        if (haden > 0 && irwin > 0 && odorata > 0 && safeda > 0 && alampur == 0 && carabao == 0) count_hios++;
+
+        # Count unique orthogroups for combinations of 5 accessions (6 ways)
+        if (alampur > 0 && carabao > 0 && haden > 0 && irwin > 0 && odorata > 0 && safeda == 0) count_achio++;
+        if (alampur > 0 && carabao > 0 && haden > 0 && irwin > 0 && safeda > 0 && odorata == 0) count_achis++;
+        if (alampur > 0 && carabao > 0 && haden > 0 && odorata > 0 && safeda > 0 && irwin == 0) count_achos++;
+        if (alampur > 0 && carabao > 0 && irwin > 0 && odorata > 0 && safeda > 0 && haden == 0) count_acios++;
+        if (alampur > 0 && haden > 0 && irwin > 0 && odorata > 0 && safeda > 0 && carabao == 0) count_ahios++;
+        if (carabao > 0 && haden > 0 && irwin > 0 && odorata > 0 && safeda > 0 && alampur == 0) count_chios++;
+
+        # Count unique orthogroups for combinations of 6 accessions (1 way)
+        if (alampur > 0 && carabao > 0 && haden > 0 && irwin > 0 && odorata > 0 && safeda > 0) count_all++;
+    }
+}
+
+END {
+    # Print results to the output file
+    print "Alampur: " count_alampur >> "'$OUTPUT_FILE'";
+    print "Carabao: " count_carabao >> "'$OUTPUT_FILE'";
+    print "Haden: " count_haden >> "'$OUTPUT_FILE'";
+    print "Irwin: " count_irwin >> "'$OUTPUT_FILE'";
+    print "Odorata: " count_odorata >> "'$OUTPUT_FILE'";
+    print "Safeda: " count_safeda >> "'$OUTPUT_FILE'";
+
+    # Print results for combinations of 2 accessions
+    print "Combination of Alampur and Carabao: " count_ac >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur and Haden: " count_ah >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur and Irwin: " count_ai >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur and Odorata: " count_ao >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur and Safeda: " count_as >> "'$OUTPUT_FILE'";
+
+    print "Combination of Carabao and Haden: " count_ch >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao and Irwin: " count_ci >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao and Odorata: " count_co >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao and Safeda: " count_cs >> "'$OUTPUT_FILE'";
+
+    print "Combination of Haden and Irwin: " count_hi >> "'$OUTPUT_FILE'";
+    print "Combination of Haden and Odorata: " count_ho >> "'$OUTPUT_FILE'";
+    print "Combination of Haden and Safeda: " count_hs >> "'$OUTPUT_FILE'";
+
+    print "Combination of Irwin and Odorata: " count_io >> "'$OUTPUT_FILE'";
+    print "Combination of Irwin and Safeda: " count_is >> "'$OUTPUT_FILE'";
+
+    print "Combination of Odorata and Safeda: " count_os >> "'$OUTPUT_FILE'";
+
+    # Print results for combinations of 3 accessions
+    print "Combination of Alampur, Carabao, and Haden: " count_ach >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, and Irwin: " count_aci >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, and Odorata: " count_aco >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, and Safeda: " count_acs >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, and Irwin: " count_ahi >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, and Odorata: " count_aho >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, and Safeda: " count_ahs >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Irwin, and Odorata: " count_aio >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Irwin, and Safeda: " count_ais >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Odorata, and Safeda: " count_aos >> "'$OUTPUT_FILE'";
+
+    print "Combination of Carabao, Haden, and Irwin: " count_chi >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Haden, and Odorata: " count_cho >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Haden, and Safeda: " count_chs >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Irwin, and Odorata: " count_cio >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Irwin, and Safeda: " count_cis >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Odorata, and Safeda: " count_cos >> "'$OUTPUT_FILE'";
+
+    print "Combination of Haden, Irwin, and Odorata: " count_hio >> "'$OUTPUT_FILE'";
+    print "Combination of Haden, Irwin, and Safeda: " count_his >> "'$OUTPUT_FILE'";
+    print "Combination of Haden, Odorata, and Safeda: " count_hos >> "'$OUTPUT_FILE'";
+    print "Combination of Irwin, Odorata, and Safeda: " count_ios >> "'$OUTPUT_FILE'";
+
+    # Print results for combinations of 4 accessions
+    print "Combination of Alampur, Carabao, Haden, and Irwin: " count_achi >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Haden, and Odorata: " count_acho >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Haden, and Safeda: " count_achs >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Irwin, and Odorata: " count_acio >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Irwin, and Safeda: " count_acis >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Odorata, and Safeda: " count_acos >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, Irwin, and Odorata: " count_ahio >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, Irwin, and Safeda: " count_ahis >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, Odorata, and Safeda: " count_ahos >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Irwin, Odorata, and Safeda: " count_aios >> "'$OUTPUT_FILE'";
+
+    print "Combination of Carabao, Haden, Irwin, and Odorata: " count_chio >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Haden, Irwin, and Safeda: " count_chis >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Haden, Odorata, and Safeda: " count_chos >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Irwin, Odorata, and Safeda: " count_cios >> "'$OUTPUT_FILE'";
+
+    print "Combination of Haden, Irwin, Odorata, and Safeda: " count_hios >> "'$OUTPUT_FILE'";
+
+    # Print results for combinations of 5 accessions
+    print "Combination of Alampur, Carabao, Haden, Irwin, and Odorata: " count_achio >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Haden, Irwin, and Safeda: " count_achis >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Haden, Odorata, and Safeda: " count_achos >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Carabao, Irwin, Odorata, and Safeda: " count_acios >> "'$OUTPUT_FILE'";
+    print "Combination of Alampur, Haden, Irwin, Odorata, and Safeda: " count_ahios >> "'$OUTPUT_FILE'";
+    print "Combination of Carabao, Haden, Irwin, Odorata, and Safeda: " count_chios >> "'$OUTPUT_FILE'";
+
+    # Print result for all 6 accessions
+    print "All accessions (Alampur, Carabao, Haden, Irwin, Odorata, Safeda): " count_all >> "'$OUTPUT_FILE'";
+}' "$INPUT_FILE"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+**** population studies
+
+Tassel missing rate > 0.20 & MAF < 0.05 & accessions with 5% above missing data were removed. 
+
+# Install bcftools if not already installed
+module load bcftools
+
+# Filter out multiallelic variants
+bcftools view -m2 -M2 -v snps mango_197_filtered_old.vcf -o mango_197_filtered.vcf
+
+*** admixture (chromosome names need to be numbers)
+
+# Load required modules
+module load plink
+module load admixture
+
+# Input VCF file and output directory
+vcf_file="../mango_197_filtered.vcf"
+output_dir="/blue/xingbo.wu/jinli/mango/population/structure"
+
+# Step 1: Convert VCF to PLINK binary format (BED, BIM, FAM)
+plink2 --vcf $vcf_file --allow-extra-chr --make-bed --out $output_dir/mango_admixture_data
+
+# Step 2: Run ADMIXTURE for K values from 1 to 10
+for K in {1..10}; do
+  echo "Running ADMIXTURE for K=$K"
+
+  admixture --cv $output_dir/mango_admixture_data.bed $K | tee $output_dir/admixture_log_K${K}.out
+
+  # Capture the cross-validation error from the log
+  grep -h "CV error" $output_dir/admixture_log_K${K}.out >> $output_dir/cv_errors.txt
+
+  echo "ADMIXTURE analysis for K=$K completed."
+done
+
+# Print out the cross-validation errors for all K values
+echo "Cross-validation errors:"
+cat $output_dir/cv_errors.txt
+
+** visualization
+
+
+** 4 clusters
+
+library(tidyverse)
+
+data = read.table("mango_admixture_data.4.Q")
+plot_data <- data %>% 
+    mutate(id = row_number()) %>% 
+    gather('pop', 'prob', V1:V4) %>% 
+    group_by(id) %>% 
+    mutate(likely_assignment = pop[which.max(prob)],
+           assingment_prob = max(prob)) %>% 
+    arrange(likely_assignment, desc(assingment_prob)) %>% 
+    ungroup() %>% 
+    mutate(id = forcats::fct_inorder(factor(id)))
+
+# reorder ID in document
+
+id_levels <- c(4, 7, 26, 29, 54, 69, 116, 133, 149, 57, 185, 31, 11, 109, 138, 167, 92, 163, 142, 148, 
+               118, 176, 14, 48, 156, 159, 24, 8, 139, 102, 22, 192, 50, 164, 128, 177, 165, 3, 173, 
+               46, 153, 170, 134, 105, 51, 127, 47, 106, 95, 150, 115, 168, 132, 75, 86, 184, 67, 179, 
+               125, 39, 59, 178, 88, 182, 20, 98, 135, 160, 61, 2, 130, 143, 157, 87, 9, 33, 35, 62, 
+               151, 126, 140, 63, 113, 193, 122, 154, 175, 121, 136, 72, 32, 90, 42, 147, 71, 91, 181, 
+               195, 55, 94, 100, 40, 84, 187, 70, 81, 36, 189, 166, 58, 131, 114, 124, 41, 16, 18, 49, 
+               144, 25, 119, 137, 53, 83, 38, 191, 172, 76, 171, 174, 64, 152, 6, 28, 10, 13, 12, 66, 
+               65, 194, 44, 158, 73, 110, 196, 190, 188, 169, 197, 103, 96, 52, 21, 17, 15, 45, 74, 85, 
+               89, 93, 101, 112, 117, 129, 141, 145, 155, 180, 183, 186, 82, 37, 99, 111, 56, 77, 107, 
+               104, 27, 68, 120, 79, 123, 78, 30, 161, 5, 108, 97, 23, 43, 19, 80, 162, 146, 1, 60, 34)
+
+plot_data$id <- factor(plot_data$id, levels=id_levels)
+
+# Custom color palette
+color_palette <- c("#F8766D", "#00BA38", "#619CFF","tan2")
+
+
+
+# plot pop structure with ggplot
+p <- ggplot(plot_data, aes(id, prob, fill = pop)) +
+    geom_col() +
+    scale_fill_manual(values = color_palette) +  # Applying the custom color palette
+    labs(x = "id", y = "prob") +
+    theme_classic() +
+    theme(axis.text.y = element_text(size = 25),
+          axis.title.y = element_text(size = 30),
+          legend.text = element_text(size = 25), 
+          legend.title = element_text(size = 30),
+          axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+
+ggsave("population_structure_4.tiff", plot = p, width = 24, height = 3, dpi = 1000)
+
+
+** 3 clusters
+
+library(tidyverse)
+
+data = read.table("mango_admixture_data.3.Q")
+plot_data2 <- data %>% 
+    mutate(id = row_number()) %>% 
+    gather('pop', 'prob', V1:V3) %>% 
+    group_by(id) %>% 
+    mutate(likely_assignment = pop[which.max(prob)],
+           assingment_prob = max(prob)) %>% 
+    arrange(likely_assignment, desc(assingment_prob)) %>% 
+    ungroup() %>% 
+    mutate(id = forcats::fct_inorder(factor(id)))
+
+
+# reorder ID in document 2 
+
+id_levels <- c(4, 7, 26, 29, 54, 69, 116, 133, 149, 57, 185, 31, 11, 109, 138, 167, 92, 163, 142, 148, 
+               118, 176, 14, 48, 156, 159, 24, 8, 139, 102, 22, 192, 50, 164, 128, 177, 165, 3, 173, 
+               46, 153, 170, 134, 105, 51, 127, 47, 106, 95, 150, 115, 168, 132, 75, 86, 184, 67, 179, 
+               125, 39, 59, 178, 88, 182, 20, 98, 135, 160, 61, 2, 130, 143, 157, 87, 9, 33, 35, 62, 
+               151, 126, 140, 63, 113, 193, 122, 154, 175, 121, 136, 72, 32, 90, 42, 147, 71, 91, 181, 
+               195, 55, 94, 100, 40, 84, 187, 70, 81, 36, 189, 166, 58, 131, 114, 124, 41, 16, 18, 49, 
+               144, 25, 119, 137, 53, 83, 38, 191, 172, 76, 171, 174, 64, 152, 6, 28, 10, 13, 12, 66, 
+               65, 194, 44, 158, 73, 110, 196, 190, 188, 169, 197, 103, 96, 52, 21, 17, 15, 45, 74, 85, 
+               89, 93, 101, 112, 117, 129, 141, 145, 155, 180, 183, 186, 82, 37, 99, 111, 56, 77, 107, 
+               104, 27, 68, 120, 79, 123, 78, 30, 161, 5, 108, 97, 23, 43, 19, 80, 162, 146, 1, 60, 34)
+
+plot_data2$id <- factor(plot_data2$id, levels=id_levels)
+
+# Custom color palette
+color_palette <- c("#F8766D", "#00BA38", "#619CFF")
+
+# plot pop structure with ggplot
+p <- ggplot(plot_data2, aes(id, prob, fill = pop)) +
+    geom_col() +
+    scale_fill_manual(values = color_palette) +  # Applying the custom color palette
+    labs(x = "id", y = "prob") +
+    theme_classic() +
+    theme(axis.text.y = element_text(size = 25),
+          axis.title.y = element_text(size = 30),
+          legend.text = element_text(size = 25), 
+          legend.title = element_text(size = 30),
+          axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+
+ggsave("population_structure_3.tiff", plot = p, width = 24, height = 3, dpi = 1000)
+
+
+
+** 2 clusters
+
+library(tidyverse)
+
+data = read.table("mango_admixture_data.2.Q")
+plot_data3 <- data %>% 
+    mutate(id = row_number()) %>% 
+    gather('pop', 'prob', V1:V2) %>% 
+    group_by(id) %>% 
+    mutate(likely_assignment = pop[which.max(prob)],
+           assingment_prob = max(prob)) %>% 
+    arrange(likely_assignment, desc(assingment_prob)) %>% 
+    ungroup() %>% 
+    mutate(id = forcats::fct_inorder(factor(id)))
+
+# reorder ID in document 3 
+
+id_levels <- c(4, 7, 26, 29, 54, 69, 116, 133, 149, 57, 185, 31, 11, 109, 138, 167, 92, 163, 142, 148, 
+               118, 176, 14, 48, 156, 159, 24, 8, 139, 102, 22, 192, 50, 164, 128, 177, 165, 3, 173, 
+               46, 153, 170, 134, 105, 51, 127, 47, 106, 95, 150, 115, 168, 132, 75, 86, 184, 67, 179, 
+               125, 39, 59, 178, 88, 182, 20, 98, 135, 160, 61, 2, 130, 143, 157, 87, 9, 33, 35, 62, 
+               151, 126, 140, 63, 113, 193, 122, 154, 175, 121, 136, 72, 32, 90, 42, 147, 71, 91, 181, 
+               195, 55, 94, 100, 40, 84, 187, 70, 81, 36, 189, 166, 58, 131, 114, 124, 41, 16, 18, 49, 
+               144, 25, 119, 137, 53, 83, 38, 191, 172, 76, 171, 174, 64, 152, 6, 28, 10, 13, 12, 66, 
+               65, 194, 44, 158, 73, 110, 196, 190, 188, 169, 197, 103, 96, 52, 21, 17, 15, 45, 74, 85, 
+               89, 93, 101, 112, 117, 129, 141, 145, 155, 180, 183, 186, 82, 37, 99, 111, 56, 77, 107, 
+               104, 27, 68, 120, 79, 123, 78, 30, 161, 5, 108, 97, 23, 43, 19, 80, 162, 146, 1, 60, 34)
+
+plot_data3$id <- factor(plot_data3$id, levels=id_levels)
+
+# Custom color palette
+color_palette <- c("#F8766D", "#00BA38")
+
+# plot pop structure with ggplot
+p <- ggplot(plot_data3, aes(id, prob, fill = pop)) +
+    geom_col() +
+    scale_fill_manual(values = color_palette) +  # Applying the custom color palette
+    labs(x = "id", y = "prob") +
+    theme_classic() +
+    theme(axis.text.y = element_text(size = 25),
+          axis.title.y = element_text(size = 30),
+          legend.text = element_text(size = 25), 
+          legend.title = element_text(size = 30),
+          axis.text.x = element_text(angle = 60, hjust = 1, size = 8))
+
+ggsave("population_structure_2.tiff", plot = p, width = 24, height = 3, dpi = 1000)
+
+
+
+*** PCA
+
+# Load required modules
+module load plink
+
+# Input VCF file and output directory
+vcf_file="../mango_197_filtered.vcf"
+output_dir="/blue/xingbo.wu/jinli/mango/population/pca"
+
+# Step 1: Convert VCF to PLINK 2 format
+plink2 --vcf $vcf_file --allow-extra-chr --make-bed --out $output_dir/mango_pca_data
+
+# Step 2: Perform PCA analysis with PLINK 2.0
+plink2 --bfile $output_dir/mango_pca_data --pca --allow-extra-chr  --out $output_dir/mango_pca_results
+
+echo "PCA analysis completed successfully."
+
+** visualization
+
+library(ggplot2)
+
+data <- read.table("mango_pca_results.eigenvec", header = FALSE, sep = "\t")
+
+colors <- c("#F8766D", "#00BA38", "#619CFF", "tan2")
+
+data$V13 <- as.factor(data$V13)
+
+data$V13 <- factor(data$V13, levels = c("NAH", "SEA", "CAR", "IN"))
+
+p <- ggplot(data, aes(x = V3, y = V4, color = V13)) +
+  geom_point(alpha = 0.8, size = 6, shape = 19) +  # Add alpha blending
+  scale_color_manual(values = colors) +   
+  labs(x = "PC1", y = "PC2", color = "K=4") +
+   theme_minimal() +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "bottom",
+    legend.text = element_text(size = 24),
+    axis.text = element_text(size = 24),
+    panel.grid = element_blank(),
+  panel.border = element_blank(),  # Remove any border from the panel
+  panel.background = element_blank(),  # Remove panel background
+  plot.background = element_blank(),  # Ensure the plot background is also blank
+  axis.line = element_line(color = "black", linewidth = 1.3),
+  legend.box.background = element_blank()
+) + 
+  theme(
+    axis.title.x = element_text(size = 24),
+    axis.title.y = element_text(size = 24)
+  )
+
+# Save the plot as a high-quality TIFF image
+ggsave("your_plot_4.tiff", plot = p, width = 8, height = 8, dpi = 1000)
+
+
+*** phylogenetic tree 
+
+** convert the VCF file into a sequence alignment in PHYLIP format
+
+# Load required modules (if necessary)
+module load python
+
+# Set input VCF and output directory
+vcf_file="/blue/xingbo.wu/jinli/mango/population/mango_197_filtered.vcf"
+alignment_file="mango_197_filtered.min4.phy"
+
+# Step 1: Convert VCF to FASTA
+python vcf2phylip.py -i $vcf_file -o $alignment_file
+
+echo "VCF to FASTA conversion completed."
+
+** build up tree 
+
+
+# Load IQ-TREE module
+module load iq-tree/2.2.2.7
+
+# Set input alignment file (PHYLIP format) and output directory
+alignment_file="/blue/xingbo.wu/jinli/mango/population/tree/vcf2phylip/mango_197_filtered.min4.phy"
+output_dir="/blue/xingbo.wu/jinli/mango/population/tree/phylogeny"
+
+# Step 1: Run IQ-TREE to construct the maximum likelihood phylogenetic tree
+iqtree -s $alignment_file -m MFP -bb 1000 -nt AUTO -pre $output_dir/mango_tree
+
+# Explanation of parameters:
+# - `-s`: Specifies the input alignment file in PHYLIP format.
+# - `-m MFP`: Model Finder Plus, which automatically selects the best substitution model.
+# - `-bb 1000`: Perform 1000 ultrafast bootstrap replicates to assess branch support.
+# - `-nt AUTO`: Automatically detects and utilizes the available number of threads.
+# - `-pre`: Prefix for the output files.
+
+echo "Phylogenetic tree construction completed."
+
+
+
+**** plot pie chart on map
+
+# Install and load required libraries
+install.packages(c("ggplot2", "sf", "rnaturalearth", "gridExtra"))
+library(ggplot2)
+library(sf)
+library(rnaturalearth)
+library(gridExtra)
+
+# Pie chart data for countries
+data <- list(
+  Australia = c(type1 = 0, type2 = 0, type3 = 0, type4 = 2),
+  Bengal = c(type1 = 0, type2 = 0, type3 = 0, type4 = 1),
+  Brazil = c(type1 = 0, type2 = 0, type3 = 2, type4 = 0),
+  Colombia = c(type1 = 0, type2 = 0, type3 = 1, type4 = 1),
+  Cuba = c(type1 = 0, type2 = 0, type3 = 1, type4 = 0),
+  Egypt = c(type1 = 0, type2 = 2, type3 = 0, type4 = 5),
+  Florida_USA = c(type1 = 44, type2 = 8, type3 = 10, type4 = 16),
+  Haiti = c(type1 = 0, type2 = 0, type3 = 2, type4 = 0),
+  Hawaii_USA = c(type1 = 3, type2 = 1, type3 = 0, type4 = 1),
+  Honduras = c(type1 = 0, type2 = 0, type3 = 1, type4 = 0),
+  India = c(type1 = 2, type2 = 2, type3 = 5, type4 = 10),
+  Indonesia = c(type1 = 0, type2 = 2, type3 = 0, type4 = 0),
+  Israel = c(type1 = 0, type2 = 1, type3 = 0, type4 = 0),
+  Malaysia = c(type1 = 0, type2 = 1, type3 = 0, type4 = 0),
+  Mexico = c(type1 = 0, type2 = 1, type3 = 0, type4 = 0),
+  Myanmar = c(type1 = 0, type2 = 1, type3 = 0, type4 = 1),
+  Panama = c(type1 = 0, type2 = 1, type3 = 0, type4 = 0),
+  Philippines = c(type1 = 0, type2 = 3, type3 = 0, type4 = 0),
+  South_Africa = c(type1 = 0, type2 = 0, type3 = 1, type4 = 0),
+  Sri_Lanka = c(type1 = 0, type2 = 0, type3 = 1, type4 = 0),
+  Thailand = c(type1 = 0, type2 = 12, type3 = 0, type4 = 0),
+  Trinidad = c(type1 = 0, type2 = 0, type3 = 2, type4 = 1),
+  Vietnam = c(type1 = 1, type2 = 3, type3 = 0, type4 = 2)
+)
+
+# Coordinates for countries (lon, lat)
+coordinates <- data.frame(
+  country = c("Australia", "Bengal", "Brazil", "Colombia", "Cuba", "Egypt", "Florida_USA", 
+              "Haiti", "Hawaii_USA", "Honduras", "India", "Indonesia", "Israel", "Malaysia", 
+              "Mexico", "Myanmar", "Panama", "Philippines", "South_Africa", "Sri_Lanka", 
+              "Thailand", "Trinidad", "Vietnam"),
+  lon = c(135.0, 90.3563, -51.9253, -74.2973, -77.7812, 30.8024, -81.7603, -72.2852, 
+          -155.5828, -86.2419, 78.9629, 113.9213, 34.8516, 101.9758, -102.5528, 95.9558, 
+          -80.7821, 121.7740, 22.9375, 80.7718, 100.9925, -61.2225, 108.2772),
+  lat = c(-25.0, 23.6850, -14.2350, 4.5709, 21.5218, 26.8206, 27.9944, 18.9712, 19.8968, 
+          15.2000, 20.5937, -0.7893, 31.0461, 4.2105, 23.6345, 21.9162, 8.5379, 12.8797, 
+          -30.5595, 7.8731, 15.8700, 10.6918, 14.0583)
+)
+
+# Define colors for the pie chart slices
+colors <- c("#F8766D", "#00BA38", "#619CFF", "tan2")
+
+# Load world map
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+# Create the base map using ggplot2
+p <- ggplot(data = world) +
+  geom_sf(fill = "grey90", color = "white") +
+  coord_sf(xlim = c(-180, 180), ylim = c(-60, 90)) +
+  theme(panel.grid = element_blank(), panel.background = element_rect(fill = "white", color = NA))
+
+# Function to create a pie chart
+create_pie <- function(values, colors, radius = 0.05) {
+  df <- data.frame(
+    value = values,
+    group = factor(seq_along(values))
+  )
+  pie <- ggplot(df, aes(x = "", y = value, fill = group)) +
+    geom_bar(width = 1, stat = "identity") +
+    coord_polar(theta = "y") +
+    scale_fill_manual(values = colors) +
+    theme_void() +
+    theme(legend.position = "none")
+  return(pie)
+}
+
+# Function to determine pie chart size based on counts
+get_radius <- function(count) {
+  if (count == 1) {
+    return(0.02)
+  } else if (count >= 2 && count <= 3) {
+    return(0.04)
+  } else if (count >= 4 && count <= 6) {
+    return(0.06)
+  } else if (count >= 7 && count <= 10) {
+    return(0.08)
+  } else {
+    return(0.1)
+  }
+}
+
+# Add pie charts at the corresponding coordinates
+for (i in 1:nrow(coordinates)) {
+  country <- coordinates$country[i]
+  lon <- coordinates$lon[i]
+  lat <- coordinates$lat[i]
+  
+  # Extract the pie chart data for the country
+  pie_data <- data[[country]]
+  
+  # Calculate the total count for the country
+  total_count <- sum(pie_data)
+  
+  # Determine the radius based on the total count
+  radius <- get_radius(total_count)
+  
+  # Create pie chart as a grob
+  pie_grob <- ggplotGrob(create_pie(pie_data, colors, radius))
+  
+  # Add the pie chart annotation to the map
+  p <- p + annotation_custom(
+    grob = pie_grob, 
+    xmin = lon - radius * 50, xmax = lon + radius * 50, 
+    ymin = lat - radius * 50, ymax = lat + radius * 50
+  )
+}
+
+# Display the map with pie charts
+p
+
+
+ggsave("mango_map.tiff", plot = p, width = 8.65*3, height = 5.46*3, dpi = 1200)
+
+
+
+**** Fst
+
+*** prepare population_file.txt
+
+pop1.txt
+pop2.txt
+pop3.txt
+pop4.txt
+
+***
+
+module load vcftools 
+
+# FST between pop1 and pop2
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop1.txt --weir-fst-pop pop2.txt --out fst_pop1_pop2
+
+# FST between pop1 and pop3
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop1.txt --weir-fst-pop pop3.txt --out fst_pop1_pop3
+
+# FST between pop1 and pop4
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop1.txt --weir-fst-pop pop4.txt --out fst_pop1_pop4
+
+# FST between pop2 and pop3
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop2.txt --weir-fst-pop pop3.txt --out fst_pop2_pop3
+
+# FST between pop2 and pop4
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop2.txt --weir-fst-pop pop4.txt --out fst_pop2_pop4
+
+# FST between pop3 and pop4
+vcftools --vcf mango_197_filtered.vcf --weir-fst-pop pop3.txt --weir-fst-pop pop4.txt --out fst_pop3_pop4
+
+
+
+#########
+
+
