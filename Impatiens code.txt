@@ -1,0 +1,3200 @@
+#### transfer HiFi bam to fastq and run FastQC 
+
+#!/bin/bash
+#SBATCH --job-name=HiFi_FastQC
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=23:00:00
+#SBATCH --mem=80G
+
+# Load modules
+module load samtools/1.17
+module load fastqc/0.12.1
+
+# Create FastQC output directory in current dir
+mkdir -p fastqc_reports
+
+# Output combined FASTQ filename
+combined_fastq="Impatiens_HiFi_combined.fastq.gz"
+
+echo "Converting and combining BAM files into $combined_fastq ..."
+
+# Loop through BAM files and append to combined gzipped FASTQ
+for bam in /orange/xingbo.wu/Rawdata/Impatiens/RawData/rawreads/*.bam; do
+    echo "Processing $bam ..."
+    samtools fastq $bam | gzip >> $combined_fastq
+done
+
+echo "Running FastQC on $combined_fastq ..."
+fastqc -t 10 -o fastqc_reports $combined_fastq
+
+echo "Done. FastQC report is in ./fastqc_reports/"
+
+
+#### 21 mer k-mer analysis 
+
+#!/bin/bash
+#SBATCH --job-name="kmc"
+#SBATCH -N 1
+#SBATCH -c 12
+#SBATCH -t 23:00:00
+#SBATCH --mem=100G
+#SBATCH --mail-user=jxl1269@gmail.com
+#SBATCH --mail-type=ALL
+
+module load kmc/3.2.1
+
+mkdir -p kmc
+
+# List all FASTQ files in the current directory
+ls *.fastq > FILES
+
+# Run KMC (write database to kmc/reads)
+kmc -k21 -t12 -m50 -ci1 -cs10000 @FILES kmc/reads kmc/
+
+# Generate histogram inside kmc/
+kmc_tools transform kmc/reads histogram kmc/reads.histo -cx10000
+
+
+#### Adapter removal using HiFiAdapterFilt (pbadapterfilt.sh v2.0.1. to remove remnant PacBio adapter)
+
+export PATH=$PATH:/blue/xingbo.wu/xingbo.wu/hifiadapterfilt/HiFiAdapterFilt
+export PATH=$PATH:/blue/xingbo.wu/xingbo.wu/hifiadapterfilt/HiFiAdapterFilt/DB
+
+module load bamtools/2.5.2
+module load ncbi_blast/2.10.1
+
+pbadapterfilt.sh -p m64310e_230314_211813.hifi_reads -t 20
+pbadapterfilt.sh -p m64310e_230316_215622.hifi_reads -t 20
+pbadapterfilt.sh -p m64310e_230318_070524.hifi_reads -t 20
+
+
+
+
+#### hifiasm assembly (results showed one haplotype is 2 Gbp while the other is 1.4 Gbp, try with lower -s 0.45 for for stronger haplotig purging, hap1 1.9 Gbp, hap2 1.6 Gbp)
+
+ml hifiasm/0.25.0
+
+hifiasm -o impatiens -t 20 -s 0.4 --h1 Impatiens_HiC_R1.fastq.gz --h2 Impatiens_HiC_R2.fastq.gz m64310e_230314_211813.hifi_reads.filt.fastq.gz m64310e_230316_215622.hifi_reads.filt.fastq.gz
+
+
+#### juicer 3D-DNA workflow
+
+
+### Create a chromosome sizes file in the format “name\tsequence_length”
+
+module load samtools/1.20
+
+samtools faidx impatiens.hic.p_ctg.fa
+cut -f 1,2 impatiens.hic.p_ctg.fa.fai > juicer/chrom.sizes
+
+
+### index genome with bwa
+
+module load bwa/0.7.8
+
+bwa index impatiens.hic.p_ctg.fa
+
+
+### run juicer 
+
+module load juicer/2.0
+
+juicer.sh \
+-A xingbo.wu \
+-C 90000000 \
+-d /blue/xingbo.wu/xingbo.wu/impatiens/juicer_working \
+-p /blue/xingbo.wu/xingbo.wu/impatiens/juicer/chrom_sizes \
+-z /blue/xingbo.wu/xingbo.wu/impatiens/impatiens.hic.p_ctg.fa
+--assembly
+
+
+### run 3D-DNA
+
+module load 3d-dna/201008
+
+run-asm-pipeline.sh impatiens.hic.p_ctg.fa juicer_working/aligned/merged_nodups.txt
+
+
+
+#### 3D-DNA postreview  
+
+
+#!/bin/bash
+#SBATCH --job-name="postreview-imp"              #name of the job submitted
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=42
+#SBATCH --mem=300G                 # adjust based on genome & reads
+#SBATCH --time=96:00:00              # Time limit hrs:min:sec
+
+
+module load java/23  
+module load 3d-dna/201008
+
+
+# Define paths
+ASSEMBLY=./impatiens.hic.p_ctg.60_HiC.review.assembly        # <-- replace with your Juicebox-edited .assembly file
+FASTA=/blue/xingbo.wu/jinli/impatiens/impatiens_walleriana/impatiens.hic.p_ctg.60.fa         # <-- your original contig fasta
+NODUPS=/blue/xingbo.wu/xingbo.wu/impatiens/juicer_working/aligned/merged_nodups.txt
+
+run-asm-pipeline-post-review.sh \
+  --sort-output \
+  -r $ASSEMBLY \
+  $FASTA \
+  $NODUPS
+
+
+
+####  Kraken2 job to classify sequences in impatiens.hic.p_ctg.60_HiC.fasta against the UFRC Kraken2 standard database
+
+#!/bin/bash
+#SBATCH --job-name=kraken2
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=44
+#SBATCH --mem=600G
+
+module load kraken/2.1.3
+
+# Input assembly
+FASTA=../impatiens.hic.p_ctg.60_HiC.fasta 
+
+# Use UFRC Kraken2 standard DB
+DB=/data/reference/kraken2/k2_pluspfp_20250714
+
+# Output files
+REPORT=kraken_report.txt
+OUTPUT=kraken_classified.tsv
+
+# Run Kraken2
+kraken2 \
+  --db $DB \
+  --threads 44 \
+  --report $REPORT \
+  --output $OUTPUT \
+  $FASTA
+
+
+
+#### clean fasta title
+
+Impatiens_glandulifera.fasta
+
+## remove chloroplast genome sequence
+
+awk '
+BEGIN {print_flag=1}
+# Header line
+/^>/ {
+    if ($0 ~ /chloroplast|mitochondrion/) {
+        print_flag=0
+    } else {
+        print_flag=1
+        print $0
+    }
+    next
+}
+# Sequence lines
+{
+    if(print_flag) print $0
+}
+' Impatiens_glandulifera.fasta > Impatiens_glandulifera_nuclear.fasta
+
+
+## Impatiens_noli-tangere.fasta
+
+awk '
+BEGIN {print_flag=1}
+# Header line
+/^>/ {
+    if ($0 ~ /chloroplast|mitochondrion/) {
+        print_flag=0
+    } else {
+        print_flag=1
+        print $0
+    }
+    next
+}
+# Sequence lines
+{
+    if(print_flag) print $0
+}
+' Impatiens_noli-tangere.fasta > Impatiens_noli-tangere_nuclear.fasta
+
+#### convert all lowercase bases (e.g., masked repeats) to uppercase
+
+for f in Impatiens_glandulifera_nuclear.fasta Impatiens_noli-tangere_nuclear.fasta Impatiens_parviflora_nuclear.fasta; do
+    awk '/^>/ {print; next} {print toupper($0)}' "$f" > "${f%.fasta}_uppercase.fasta"
+done
+
+#### clean seq header
+
+awk '/^>/{ 
+    if ($0 ~ /chromosome/) { 
+        split($0,a," "); 
+        print a[1]"|chromosome" 
+    } else if ($0 ~ /scaffold/) { 
+        split($0,a," "); 
+        print a[1]"|scaffold" 
+    } 
+    next 
+} 
+{print}' Impatiens_glandulifera_nuclear_uppercase.fasta > Impatiens_glandulifera_nuclear_clean.fasta
+
+
+for f in Impatiens_glandulifera_nuclear_uppercase.fasta \
+         Impatiens_parviflora_nuclear_uppercase.fasta \
+         Impatiens_noli-tangere_nuclear_uppercase.fasta
+do
+    out="${f/_uppercase.fasta/_clean.fasta}"
+    awk '/^>/{ 
+        if ($0 ~ /chromosome/) { 
+            split($0,a," "); 
+            print a[1]"|chromosome" 
+        } else if ($0 ~ /scaffold/) { 
+            split($0,a," "); 
+            print a[1]"|scaffold" 
+        } 
+        next 
+    } 
+    {print}' "$f" > "$out"
+done
+
+#### BUSCO completeness 
+
+#!/bin/bash
+#SBATCH --job-name=busco
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=10
+#SBATCH --mem-per-cpu=10g
+#SBATCH --time=96:00:00
+
+module load busco/5.8.3
+
+# Paths
+GENOMES=( \
+    /blue/xingbo.wu/jinli/impatiens/genus/Impatiens_glandulifera_clean.fasta \
+    /blue/xingbo.wu/jinli/impatiens/genus/Impatiens_noli-tangere_clean.fasta \
+    /blue/xingbo.wu/jinli/impatiens/genus/Impatiens_parviflora_clean.fasta \
+)
+BUSCO_DB_DIR=/orange/xingbo.wu/jinli/mango/analysis/busco/busco_downloads
+LINEAGE=embryophyta_odb10
+OUTPUT_DIR=./
+
+mkdir -p "$OUTPUT_DIR"
+
+for ASSEMBLY in "${GENOMES[@]}"; do
+    BASENAME=$(basename "$ASSEMBLY" .fasta)
+    busco \
+        -i "$ASSEMBLY" \
+        -l "$LINEAGE" \
+        --download_path "$BUSCO_DB_DIR" \
+        -o "$OUTPUT_DIR/${BASENAME}_busco" \
+        -m genome \
+        -c "$SLURM_CPUS_PER_TASK"
+done
+
+
+#### QUAST evaluation
+
+#!/bin/bash
+#SBATCH --job-name=quast_impatiens
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=10
+#SBATCH --mem-per-cpu=10G
+#SBATCH --time=23:00:00
+
+module load quast/5.2.0
+
+# Define genomes and corresponding output folders
+declare -A GENOMES
+GENOMES["Impatiens_glandulifera"]="/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_glandulifera_clean.fasta"
+GENOMES["Impatiens_nolitangere"]="/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_noli-tangere_clean.fasta"
+GENOMES["Impatiens_parviflora"]="/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_parviflora_clean.fasta"
+
+# Loop through each genome and run QUAST
+for GENOME_NAME in "${!GENOMES[@]}"; do
+    GENOME_FILE=${GENOMES[$GENOME_NAME]}
+    OUTDIR="/blue/xingbo.wu/jinli/impatiens/genus/evaluation/quast/quast_${GENOME_NAME}_output"
+    quast -o $OUTDIR $GENOME_FILE -t 10
+done
+
+
+#### repeatmodeler and repeatmasker
+                                                                                                                                                                             
+#!/bin/bash
+#SBATCH --job-name=repeatmodeler
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=48
+#SBATCH --mem=500G
+#SBATCH -t 96:00:00
+#SBATCH --array=0-2      # Array for 3 genomes
+
+# Load modules
+module load repeatmodeler/2.0
+module load repeatmasker/4.1.7
+
+# Define genome files (full paths) and corresponding output folders
+GENOMES=("/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_glandulifera_clean.fasta" \
+         "/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_noli-tangere_clean.fasta" \
+         "/blue/xingbo.wu/jinli/impatiens/genus/Impatiens_parviflora_clean.fasta")
+
+OUTDIRS=("Repeat_result_glandulifera" "Repeat_result_nolitangere" "Repeat_result_parviflora")
+DB_NAMES=("glandulifera" "nolitangere" "parviflora")
+
+# Select genome for this array task
+GENOME=${GENOMES[$SLURM_ARRAY_TASK_ID]}
+OUTDIR=${OUTDIRS[$SLURM_ARRAY_TASK_ID]}
+DB_NAME=${DB_NAMES[$SLURM_ARRAY_TASK_ID]}
+
+# Create output directory and cd into it
+mkdir -p $OUTDIR
+cd $OUTDIR
+
+# Step 1: Build the RepeatModeler database
+BuildDatabase -name $DB_NAME -engine ncbi $GENOME
+
+# Step 2: Run RepeatModeler to build the custom repeat library
+RepeatModeler -pa $SLURM_CPUS_PER_TASK -database $DB_NAME -LTRStruct
+
+# Step 3: Run RepeatMasker using the library
+RepeatMasker -pa $SLURM_CPUS_PER_TASK \
+-e rmblast -lib ${DB_NAME}-families.fa \
+-xsmall -gff $GENOME
+
+echo "RepeatMasker job for $GENOME completed successfully."
+
+
+#### BRAKER
+
+#!/bin/bash
+#SBATCH --job-name=braker3
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=42
+#SBATCH --mem=300G
+#SBATCH --time=4-00:00:00
+#SBATCH --array=0-0
+
+module load braker/3.0.8
+
+# === Common inputs ===
+PROT=/orange/xingbo.wu/jinli/mango/data/Impatiens_glandulifera_plus_Viridiplantae.faa
+AUGUSTUS_CONFIG=/blue/xingbo.wu/jinli/avocado/tools/augustus_config
+NEW_SPECIES_SCRIPT=/apps/augustus/3.5.0/bin/new_species.pl
+WORKDIR=/blue/xingbo.wu/jinli/impatiens/genus/annotation/braker3
+GENOME_DIR=/blue/xingbo.wu/jinli/impatiens/genus/annotation/genome
+ALIGN_DIR=/blue/xingbo.wu/jinli/impatiens/genus/annotation/alignment
+
+# === List of genomes ===
+GENOMES=
+(
+  Impatiens_glandulifera_clean.fasta.masked
+  Impatiens_noli-tangere_clean.fasta.masked
+  Impatiens_parviflora_clean.fasta.masked
+  Impatiens_walleriana_clean.fasta.masked
+)
+
+# === Select genome for this array task ===
+GENOME=${GENOMES[$SLURM_ARRAY_TASK_ID]}
+# Remove "_clean" and ".fasta.masked" for prefix
+PREFIX=$(basename "$GENOME" | sed 's/_clean\.fasta\.masked//')
+
+GENOME_PATH=$GENOME_DIR/$GENOME
+BAM_DIR=$ALIGN_DIR/$PREFIX
+BAM_LIST=$(ls "$BAM_DIR"/*.sorted.bam 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+
+# === Set species name for AUGUSTUS ===
+SPECIES=aug_${PREFIX}
+
+# === Run BRAKER ===
+echo "[$(date)] Running BRAKER on $PREFIX with species $SPECIES..."
+braker.pl \
+  --genome="$GENOME_PATH" \
+  --prot_seq="$PROT" \
+  --bam="$BAM_LIST" \
+  --threads="$SLURM_CPUS_PER_TASK" \
+  --AUGUSTUS_CONFIG_PATH="$AUGUSTUS_CONFIG" \
+  --species="$SPECIES" \
+  --workingdir="$WORKDIR/$PREFIX" \
+  --gff3 \
+
+echo "[$(date)] BRAKER finished for $PREFIX."
+
+
+#### OrthoFinder clean protein fasta header
+
+#!/bin/bash
+
+# List of FASTA files
+files=(
+  "Impatiens_glandulifera.fasta"
+  "Impatiens_noli-tangere.fasta"
+  "Impatiens_parviflora.fasta"
+  "Impatiens_walleriana.fasta"
+)
+
+# Loop through each file
+for f in "${files[@]}"; do
+    # Extract species name (without .fasta) and ensure it contains "Impatiens"
+    species="${f%.fasta}"
+    if [[ "$species" != Impatiens* ]]; then
+        species="Impatiens_$species"
+    fi
+    
+    # Append species name to each header
+    sed 's/^>\(.*\)/>\1|'"$species"'/' "$f" > "${species}_modified.fasta"
+    echo "Processed $f → ${species}_modified.fasta"
+done
+
+
+#### CD-hit - retain only the longest isoform
+
+#!/bin/bash
+#SBATCH --job-name=cdhit_batch
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+
+# Load the CD-HIT module
+module load cdhit/4.6.8
+
+# Create output directory if it doesn't exist
+mkdir -p longest_isoform
+
+# Set identity threshold (adjust if necessary)
+IDENTITY_THRESHOLD=0.99
+
+# Loop through all .aa files in the current folder
+for file in *.fasta; do
+    # Extract the filename without the extension
+    base_name=$(basename "$file" .fasta)
+
+    # Run CD-HIT to retain the longest isoform for each protein
+    cd-hit -i "$file" -o "longest_isoform/${base_name}_longest_isoform.fasta" -c $IDENTITY_THRESHOLD -n 5 -d 0
+
+    echo "Processed $file"
+done
+
+echo "CD-HIT clustering completed for all .fasta files."
+
+
+#### orthofinder
+
+#!/bin/bash
+#SBATCH --job-name="orthofinder"              #name of the job submitted
+#SBATCH --ntasks=1                    # Run on a single CPU
+#SBATCH -t 23:00:00              # Time limit hrs:min:sec
+#SBATCH --cpus-per-task=10            # Number of CPU Cores per task
+#SBATCH --mem=100G
+#SBATCH --qos=xingbo.wu-b 
+#SBATCH --mail-user=jxl1269@gmail.com      #email address
+
+# Load necessary modules (adjust if your system uses environment modules)
+module load orthofinder/2.5.5  # Adjust version as per your installation
+
+# Define the directory containing .aa files
+AA_DIR="./"
+
+# Run OrthoFinder on all the .aa files in the longest_isoform directory
+orthofinder -f "$AA_DIR" -t 10 -a 10  # Adjust -t and -a for your CPU resources
+
+echo "OrthoFinder job completed."
+
+
+#### mafft alignment 
+
+
+#!/bin/bash
+#SBATCH --job-name=mafft
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --mem=100G
+#SBATCH --time=23:00:00
+#SBATCH --cpus-per-task=10
+
+
+module load mafft/7.520
+
+for file in ../OG*.fa
+do
+    base=$(basename $file)
+    mafft --thread 10 --auto $file > aligned_$base
+done
+
+
+#### gblock remove poorly aligned regions 
+
+#!/bin/bash
+#SBATCH --job-name=gblock
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --mem=100G
+#SBATCH --time=23:00:00
+#SBATCH --cpus-per-task=10
+
+
+module load gblocks/0.91b
+
+# Create an output directory for the trimmed files
+mkdir -p trimmed_files
+
+# Loop through the aligned files in the parent directory (../)
+for file in ../aligned_OG*.fa
+do
+    # Extract the filename without the path
+    base=$(basename $file)
+    
+    # Run Gblocks on the aligned file
+    Gblocks $file -t=p -b4=5 -b5=a
+    
+    # Move the trimmed files to the trimmed_files directory
+    mv ../${base}-gb* trimmed_files/
+done
+
+
+
+#### merge reads  (Merges all Gblocks-trimmed files. Removes spaces. Removes line breaks in sequences. Concatenates sequences by species/cultivar and writes one FASTA per species. Combine into one fasta for iqtree)
+
+#!/bin/bash
+
+# --- Step 1: Merge all GBlocks-trimmed files ---
+cat ./*-gb > combined.fasta
+
+# --- Step 2: Remove all spaces in sequences ---
+sed 's/ //g' combined.fasta > combined_no_spaces.fasta
+
+# --- Step 3: Merge multi-line sequences into a single line per sequence ---
+awk '!/^>/ {printf "%s", $0; n=1; next} n {print ""; n=0} 1' combined_no_spaces.fasta > combined_no_spaces_linebreaks.fasta
+
+# --- Step 4: Separate sequences by species/cultivar and concatenate ---
+input="combined_no_spaces_linebreaks.fasta"
+
+awk '
+BEGIN { OFS="" }
+# Header line
+/^>/ {
+    if (seq != "" && sp != "") {
+        seqs[sp] = seqs[sp] seq
+    }
+    seq = ""
+
+    # Extract species/cultivar name
+    if (match($0, /\|([A-Za-z_]+)/, a)) {
+        sp = a[1]
+    } else if (match($0, /^>([^_]+)_g[0-9]+/, b)) {
+        sp = b[1]
+    } else {
+        sp = substr($0, 2)  # fallback: raw header without ">"
+    }
+    next
+}
+# Sequence lines
+{
+    seq = seq $0
+}
+END {
+    if (seq != "" && sp != "") {
+        seqs[sp] = seqs[sp] seq
+    }
+
+    # Write each species to its own file
+    for (s in seqs) {
+        out = s "_concatenated.fasta"
+        print ">" s "\n" seqs[s] > out
+    }
+}' "$input"
+
+echo "✅ GBlocks merge and concatenation complete. Each species has its own FASTA."
+
+# --- Step 5: Merge all concatenated species FASTA files into one file for IQ-TREE
+ 
+# Create folder if not exists
+mkdir -p iqtree
+
+cat *_concatenated.fasta > ./iqtree/all_species_concatenated.fasta
+
+
+
+
+#### Mega 11 timetree data time
+
+## calibration 
+
+Camellia fascicularis and Vaccinium darrowii, adjust time: 94 MYA 
+
+Rhododendron molle and Vaccinium darrowii, adjust time: 69 MYA 
+
+## model 
+
+1. Jones Taylor Thornton (JJT) model 
+2. Uniform Rates
+
+
+
+#### CAFE 
+
+### format gene count file and filter large families (>100 genes) to avoid unstable likelihoods
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+input="Orthogroups.GeneCount.tsv"
+tabbed="Orthogroups.GeneCount.tab.tsv"
+no_vitis="Orthogroups.GeneCount.noVitis.tsv"
+modified="Orthogroups.GeneCount.modified.tsv"
+filtered="Orthogroups.GeneCount.filtered.tsv"
+
+# ===================================================
+# Step 0: Normalize whitespace to single TAB
+# ===================================================
+awk '{$1=$1}1' OFS='\t' "$input" > "$tabbed"
+
+# ===================================================
+# Step 1: Remove Vitis_vinifera.clean column
+# ===================================================
+awk -F'\t' -v OFS='\t' '
+NR==1 {
+    skip_col=0
+    for (i=1; i<=NF; i++) {
+        if ($i == "Vitis_vinifera.clean") skip_col=i
+    }
+}
+{
+    first=1
+    for (i=1; i<=NF; i++) {
+        if (i != skip_col) {
+            if (!first) printf OFS
+            printf "%s", $i
+            first=0
+        }
+    }
+    print ""
+}' "$tabbed" > "$no_vitis"
+
+echo "✅ Removed Vitis_vinifera.clean column."
+
+# ===================================================
+# Step 2: Add Desc, remove Total, trim headers
+# ===================================================
+awk -F'\t' -v OFS='\t' '
+NR==1 {
+    printf "Desc"
+    printf OFS "%s", $1
+    for (i=2; i<NF; i++) {
+        split($i, a, "_")
+        if (length(a) >= 2)
+            printf OFS "%s_%s", a[1], a[2]
+        else
+            printf OFS "%s", $i
+    }
+    print ""
+    next
+}
+{
+    printf "(null)"
+    for (i=1; i<NF; i++)
+        printf OFS "%s", $i
+    print ""
+}' "$no_vitis" > "$modified"
+
+echo "✅ Created cleaned file with Desc column -> $modified"
+
+# ===================================================
+# Step 3: Run clade_and_size_filter.py
+# ===================================================
+python clade_and_size_filter.py \
+    -i "$modified" \
+    -o "$filtered" \
+    -s 
+
+echo "✅ Filtering done."
+echo "Filtered file: $filtered"
+
+
+#### run CAFE
+
+#!/bin/bash
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --job-name=CAFE
+#SBATCH --mem=200G
+#SBATCH --time=23:00:00
+#SBATCH --cpus-per-task=25
+
+ml conda
+
+# If installed via Conda:
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate cafe5_env
+
+
+
+# Run CAFE
+cafe5 \
+    -i Orthogroups.GeneCount.filtered.tsv \
+    -t timetree.nwk \
+    --output_prefix cafe_ortho \
+    --cores 25
+
+
+
+#### VennDiagram
+
+
+
+library(tidyverse)
+library(VennDiagram)
+library(RColorBrewer)
+library(grid)
+
+# ----------------------
+# Step 1: Read and process data
+# ----------------------
+gene_counts <- read.delim("Orthogroups.GeneCount.tsv", stringsAsFactors = FALSE)
+impatiens_cols <- grep("Impatiens", colnames(gene_counts))
+imp_counts <- gene_counts[, impatiens_cols]
+
+# Convert to presence/absence
+imp_binary <- ifelse(imp_counts > 0, 1, 0)
+rownames(imp_binary) <- gene_counts$Orthogroup
+
+# Clean species names
+clean_names <- colnames(imp_binary) %>%
+  str_replace("_modified_longest_isoform", "") %>%
+  str_replace("_", " ") %>%
+  str_replace("\\.", "-")
+
+clean_names <- sapply(clean_names, function(x) {
+  parts <- unlist(strsplit(x, " "))
+  paste0(toupper(substr(parts[1],1,1)), substr(parts[1],2,nchar(parts[1])), " ",
+         tolower(parts[2]))
+})
+colnames(imp_binary) <- clean_names
+
+# ----------------------
+# Step 2: Prepare list for Venn
+# ----------------------
+venn_list <- lapply(colnames(imp_binary), function(sp) {
+  rownames(imp_binary)[imp_binary[, sp] == 1]
+})
+names(venn_list) <- colnames(imp_binary)
+
+colors <- brewer.pal(length(venn_list), "Set2")
+
+# ----------------------
+# Step 3: Draw Venn diagram without default labels
+# ----------------------
+venn.plot <- venn.diagram(
+  x = venn_list,
+  filename = NULL,
+  fill = colors,
+  alpha = 0.6,
+  cex = 2.7,             # counts inside circles
+  fontface = "plain",
+  fontfamily = "Arial",
+  cat.cex = 0,           # remove default labels
+  margin = 0.1,
+  main = NULL
+)
+
+# ----------------------
+# Step 4: Save high-resolution Venn diagram
+# ----------------------
+png("Impatiens_Venn.png", width = 12, height = 12, units = "in", res = 800)
+grid.newpage()
+grid.draw(venn.plot)
+
+# Add species labels above circles
+label_positions <- data.frame(
+  species = clean_names,
+  x = c(0.1, 0.3, 0.7, 0.9),       # approximate horizontal positions
+  y = c(0.85, 0.92, 0.92, 0.85)    # outer lower, middle higher
+)
+
+for(i in 1:nrow(label_positions)){
+  grid.text(
+    label = label_positions$species[i],
+    x = label_positions$x[i],
+    y = label_positions$y[i],
+    gp = gpar(fontface = "italic", fontfamily = "Arial", cex = 2.7)
+  )
+}
+dev.off()
+
+
+
+
+
+#### wgd
+
+### get cds from braker 3 output 
+
+#!/bin/bash
+
+# Base path
+BASE="/blue/xingbo.wu/jinli/impatiens/genus/annotation/braker3"
+
+# List of species
+species=("Impatiens_glandulifera" "Impatiens_noli-tangere" "Impatiens_parviflora" "Impatiens_walleriana")
+
+# Loop over species
+for sp in "${species[@]}"; do
+    # Copy and rename
+    cp "${BASE}/${sp}/braker.codingseq" "./${sp}_cds.fasta"
+done
+
+
+
+
+
+#### run wgd (self and pair)
+
+#### self vs self
+                                                                                                                            
+#!/bin/bash
+#SBATCH --job-name=wgd_all
+#SBATCH -n 10
+#SBATCH --mem=100G
+#SBATCH -t 48:00:00
+#SBATCH --qos=xingbo.wu-b
+
+# Load modules
+ml diamond/2.1.8
+ml wgd/2.0.38
+ml paml/4.10.9
+ml mafft/7.520
+ml mcl/14-137
+ml fasttree/2.1.11
+
+
+# List of species CDS FASTA files
+species=("Impatiens_glandulifera" "Impatiens_noli-tangere" "Impatiens_parviflora" "Impatiens_walleriana")
+
+for sp in "${species[@]}"; do
+    echo "Processing $sp"
+
+    # Step 1: Compute gene families / paranome
+    wgd dmd "${sp}_cds.fasta"
+
+    # Step 2: Calculate Ks distribution
+    # The TSV file is inside wgd_dmd/
+    wgd ksd "wgd_dmd/${sp}_cds.fasta.tsv" "${sp}_cds.fasta"
+done
+
+
+
+#### pairwise comparison 
+
+#!/bin/bash
+#SBATCH --job-name=wgd
+#SBATCH -n 10
+#SBATCH --mem=100G
+#SBATCH -t 24:00:00
+#SBATCH --qos=xingbo.wu-b
+
+ml diamond/2.1.8
+ml wgd/2.0.38
+ml paml/4.10.9
+ml mafft/7.520
+ml mcl/14-137
+
+
+# CDS files
+CDS_FILES=(
+    Impatiens_glandulifera_cds.fasta
+    Impatiens_noli-tangere_cds.fasta
+    Impatiens_parviflora_cds.fasta
+    Impatiens_walleriana_cds.fasta
+)
+
+# 1️⃣ Run pairwise DMD and Ks calculation
+N=${#CDS_FILES[@]}
+for ((i=0;i<N;i++)); do
+    for ((j=i+1;j<N;j++)); do
+
+        GENOME1=${CDS_FILES[i]}
+        GENOME2=${CDS_FILES[j]}
+
+        BASENAME1=$(basename $GENOME1 .fasta)
+        BASENAME2=$(basename $GENOME2 .fasta)
+
+        # Create folder for this pair
+        PAIR_DIR=./${BASENAME1}_vs_${BASENAME2}
+        mkdir -p $PAIR_DIR
+
+        echo "Running WGD DMD for $BASENAME1 vs $BASENAME2..."
+        wgd dmd --globalmrbh $GENOME1 $GENOME2 -o $PAIR_DIR
+
+        echo "Running WGD KSD for $BASENAME1 vs $BASENAME2..."
+        wgd ksd $PAIR_DIR/global_MRBH.tsv \
+            $GENOME1 $GENOME2 \
+            --spair "${BASENAME1};${BASENAME2}" \
+            -o $PAIR_DIR \
+            --plotkde
+
+    done
+done
+
+
+
+#### wgd plot 
+
+
+
+library(ggplot2)
+library(dplyr)
+
+ksd <- read.csv("wgd.csv", header=TRUE, stringsAsFactors=FALSE)
+
+short_names <- c(
+  "Impatiens_noli_tangere_vs_Impatiens_walleriana" = "I. walleriana vs. I. noli-tangere",
+  "Impatiens_glandulifera_vs_Impatiens_walleriana" = "I. walleriana vs. I. glandulifera",
+  "Impatiens_parviflora_vs_Impatiens_walleriana"   = "I. walleriana vs. I. parviflora",
+  "Impatiens_glandulifera_vs_Impatiens_noli_tangere"= "I. noli-tangere vs. I. glandulifera",
+  "Impatiens_noli_tangere_vs_Impatiens_parviflora"  = "I. noli-tangere vs. I. parviflora",
+  "Impatiens_glandulifera_vs_Impatiens_parviflora"  = "I. glandulifera vs. I. parviflora"
+)
+
+desired_order <- names(short_names)
+ksd$pair <- factor(ksd$pair, levels = desired_order)
+
+# --- compute peaks using SAME smoothing as plot ---
+peak_df <- ksd %>%
+  group_by(pair) %>%
+  do({
+    d <- density(.$dS, adjust = 4, n = 8192)
+    data.frame(peak = d$x[which.max(d$y)])
+  }) %>%
+  ungroup() %>%
+  mutate(pair = factor(pair, levels = desired_order)) %>%
+  arrange(pair)
+
+extract_species <- function(x){
+  strsplit(x, " vs. ")[[1]]
+}
+
+label_expr <- sapply(seq_len(nrow(peak_df)), function(i){
+  sp <- extract_species(short_names[as.character(peak_df$pair[i])])
+  peak <- round(peak_df$peak[i], 2)
+  parse(text = paste0(
+    "italic('", sp[1], "') ~ 'vs.' ~ italic('", sp[2], "') ~ '(", peak, ")'"
+  ))
+})
+
+label_map <- setNames(label_expr, as.character(peak_df$pair))
+
+colors <- c("#377EB8","#E41A1C","#FF7F00","#4DAF4A","#A65628","#984EA3")
+names(colors) <- desired_order
+
+p <- ggplot(ksd, aes(x=dS, color=pair)) +
+  geom_density(size=2, adjust=4, alpha=0.8, lineend="round", n=8192) +
+  theme_classic() +
+  xlab("dS") + ylab("Density") +
+  scale_color_manual(values=colors, labels=label_map) +
+  theme(
+    text = element_text(size=35, family="Arial"),
+    axis.line = element_line(size=2),
+    axis.ticks = element_line(size=1.8),
+    axis.ticks.length = unit(0.35, "cm"),
+    plot.margin = margin(20, 25, 20, 25),
+    legend.title = element_blank(),
+    legend.key.width = unit(1, "cm"),
+    legend.key.height = unit(1.2, "cm"),
+    legend.spacing.y = unit(0.5, "cm"),
+    legend.text = element_text(size=32)
+  ) +
+  coord_cartesian(xlim=c(0, 1.2), ylim=c(0,5))
+
+ggsave("Ks_plot.png", plot=p, width=20, height=8, dpi=600, units="in")
+
+
+ 
+
+
+
+#### circos 
+
+
+### prepare karyotype.txt file
+
+
+## check all scaffold length
+
+ml samtools 
+
+samtools faidx Impatiens_walleriana.fasta
+
+cut -f1,2 Impatiens_walleriana.fasta.fai > genome.sizes
+
+awk '{print "chr - "$1" "$1" 0 "$2" blue"}' genome.sizes | head -n 8 > karyotype.txt
+
+
+## retain only chromosomes 
+
+ml seqkit
+
+seqkit grep -n -p "Iw1" -p "Iw2" -p "Iw3" -p "Iw4" -p "Iw5" -p "Iw6" -p "Iw7" -p "Iw8" Impatiens_walleriana.fasta > Impatiens_walleriana_chr.fasta
+
+
+### GC content 
+
+#!/bin/bash
+#SBATCH --job-name=Imp_GC
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=10:00:00
+
+REF="../Impatiens_walleriana_chr.fasta"
+OUTDIR=./
+
+WINDOW=1000000  # 1000 kb windows
+
+python3 << EOF
+from Bio import SeqIO
+
+ref_file = "$REF"
+out_file = "$OUTDIR/Impatiens_GC_${WINDOW}.bed"
+window = int("$WINDOW")
+
+with open(out_file, 'w') as out:
+    for record in SeqIO.parse(ref_file, "fasta"):
+        chrom = record.id
+        seq = str(record.seq).upper()
+        for i in range(0, len(seq), window):
+            window_seq = seq[i:i+window]
+            gc = window_seq.count('G') + window_seq.count('C')
+            if len(window_seq) > 0:
+                gc_percent = gc / len(window_seq) * 100
+                out.write(f"{chrom}\t{i}\t{i+len(window_seq)}\t{gc_percent:.2f}\n")
+EOF
+
+### filter out windows that are smaller than a threshold (<50 kb) 
+
+awk '{if($3-$2 > 50000) print $0}' Impatiens_GC_1000000.bed > Impatiens_GC_1000000_filtered.bed
+
+
+### gene bed 
+
+#!/bin/bash
+#SBATCH --job-name=Imp_GeneBed
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=02:00:00
+
+# -----------------------------
+# Paths
+# -----------------------------
+GFF="braker.gff3"
+OUTDIR="./"
+OUTBED="$OUTDIR/Impatiens_genes.bed"
+
+# -----------------------------
+# Extract gene coordinates
+# -----------------------------
+echo "Extracting gene coordinates from $GFF ..."
+
+awk 'BEGIN{OFS="\t"} 
+    $3=="gene" {
+        id=$9
+        sub(/^ID=/,"",id)
+        sub(/;.*/,"",id)
+        print $1, $4-1, $5, id
+    }' $GFF > $OUTBED
+
+echo "Gene BED file generated: $OUTBED"
+
+
+### TE
+
+#!/bin/bash
+#SBATCH --job-name=Imp_TE_density
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+
+# -----------------------------
+# Paths
+# -----------------------------
+GFF="./impatiens.fasta.out.gff"
+OUTBED="./Impatiens_TE.bed"
+
+# -----------------------------
+# Extract TE regions with type
+# -----------------------------
+awk 'BEGIN{OFS="\t"} 
+     !/^#/ && $3 ~ /repeat|transposon|retrotransposon|dispersed_repeat/ {print $1, $4-1, $5, $3}' \
+     $GFF > $OUTBED
+
+echo "TE BED file created: $OUTBED"
+
+
+### Variant
+
+## call large SVs with sniffles
+
+#!/bin/bash
+#SBATCH --job-name=Imp_HiFi_variants
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=30
+#SBATCH --mem=300G
+#SBATCH --time=96:00:00
+
+
+module load minimap2/2.28
+module load samtools/1.20
+module load bcftools/1.22
+module load sniffles2/2.0.6
+
+# -----------------------------
+# Paths
+# -----------------------------
+REF="../Impatiens_walleriana_chr.fasta"
+READS="/blue/xingbo.wu/jinli/impatiens/reads/hifi/trim/Impatiens_HiFi_combined.filt.fastq.gz"
+OUTDIR="/blue/xingbo.wu/jinli/impatiens/circos/Variant"
+mkdir -p $OUTDIR
+
+BAM="$OUTDIR/Impatiens_HiFi.sorted.bam"
+
+# -----------------------------
+# 1. Align HiFi reads to reference
+# -----------------------------
+echo "Aligning HiFi reads with minimap2..."
+#minimap2 -ax map-hifi -t 30 $REF $READS | samtools view -b -@ 4 -o $OUTDIR/Impatiens_HiFi.bam
+
+# -----------------------------
+# 2. Sort and index BAM
+# -----------------------------
+echo "Sorting BAM..."
+#samtools sort -@ 30 -o $BAM $OUTDIR/Impatiens_HiFi.bam
+#samtools index $BAM
+
+# -----------------------------
+# 3. Call variants with Sniffles2
+# -----------------------------
+echo "Calling variants with Sniffles2..."
+sniffles -i $BAM \
+         --vcf $OUTDIR/Impatiens_HiFi.sniffles.vcf.gz \
+         --threads 30 \
+         --minsvlen 35 \
+         --minsupport 3
+
+
+# -----------------------------
+# 4. Filter high-quality variants
+# -----------------------------
+echo "Filtering high-quality variants (SUPPORT >= 5 & QUAL>=30 & AF >= 0.2)..."
+bcftools view -i 'SUPPORT >= 5 && QUAL>=30 && AF >= 0.2' \
+    -Oz -o $OUTDIR/Impatiens_HiFi.sniffles.filtered.vcf.gz \
+    $OUTDIR/Impatiens_HiFi.sniffles.vcf.gz
+
+bcftools index $OUTDIR/Impatiens_HiFi.sniffles.filtered.vcf.gz
+
+# -----------------------------
+# 5. Done
+# -----------------------------
+echo "Variant calling and filtering completed."
+echo "Filtered VCF: $OUTDIR/Impatiens_HiFi.sniffles.filtered.vcf.gz"
+
+
+
+### call SNPs and INDELs with mpileup
+
+#!/bin/bash
+#SBATCH --job-name=Imp_mpileup
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=30
+#SBATCH --mem=300G
+#SBATCH --time=4-00:00:00
+
+module load bcftools/1.22
+module load samtools/1.20
+
+# -----------------------------
+# Paths
+# -----------------------------
+REF="../Impatiens_walleriana_chr.fasta"
+BAM="./Impatiens_HiFi.sorted.bam"
+
+OUTDIR="./"
+mkdir -p $OUTDIR
+
+VCF="$OUTDIR/Impatiens_HiFi.snps_indels.vcf.gz"
+FILTERED="$OUTDIR/Impatiens_HiFi.snps_indels.filtered.vcf.gz"
+
+# -----------------------------
+# 1. Call SNPs + small indels
+# -----------------------------
+echo "Calling SNPs + small indels with bcftools..."
+
+#bcftools mpileup \
+#    -f $REF \
+#    -a FORMAT/DP \
+#    -Ou \
+#    $BAM \
+#| bcftools call \
+#    -mv \
+#    -Oz \
+#    --threads 30 \
+#    -o $VCF
+
+#bcftools index $VCF
+
+# -----------------------------
+# 2. Filter high-confidence variants
+# -----------------------------
+echo "Filtering variants (QUAL>30 & DP>10)..."
+
+bcftools filter \
+    -i 'QUAL>30 && FORMAT/DP>10' \
+    -Oz \
+    -o $FILTERED \
+    $VCF
+
+bcftools index $FILTERED
+
+echo "Done!"
+echo "Raw VCF:     $VCF"
+echo "Filtered VCF: $FILTERED"
+
+
+
+
+
+### =======================================================
+### Circos-ready file generation from VCF and SV data
+### =======================================================
+
+# Input VCF files
+VCF="Impatiens_HiFi.snps_indels.filtered.vcf.gz"
+SV_VCF="Impatiens_HiFi.sniffles.filtered.vcf.gz"
+
+# Output files for Circos
+SNP_OUT="circos_snps.txt"
+INDEL_OUT="circos_indels.txt"
+INV_OUT="inversions.circos.txt"
+
+# Clear output files
+> $SNP_OUT
+> $INDEL_OUT
+> $INV_OUT
+
+### ------------------------------
+### 1. Convert SNPs and INDELs to Circos format
+### ------------------------------
+# SNPs: single-base variants
+# INDELs: insertion/deletion variants
+# Circos format: chromosome, start (0-based), end, weight
+
+zcat $VCF | awk 'BEGIN{OFS="\t"}
+    !/^#/ {
+        chrom=$1
+        pos=$2
+        ref=$4
+        alt=$5
+        # SNP: single-base change
+        if(length(ref)==1 && length(alt)==1){
+            print chrom, pos-1, pos, 1 >> "'$SNP_OUT'"
+        }
+        # INDEL: length difference between ref and alt
+        else if(length(ref)!=length(alt)){
+            print chrom, pos-1, pos+length(ref)-1, 1 >> "'$INDEL_OUT'"
+        }
+    }'
+
+### ------------------------------
+### 2. Convert inversions (SVs) to Circos format
+### ------------------------------
+# Only inversions are kept
+# Circos format: chromosome, start, end
+
+zcat $SV_VCF | \
+awk '$0 !~ /^#/ && $8 ~ /SVTYPE=INV/ {
+    split($8, a, ";");
+    for(i in a) if(a[i] ~ /^END=/) end_pos=substr(a[i],5);
+    print $1, $2, end_pos
+}' > $INV_OUT
+
+awk '{print $1, $2, $3, 1}' OFS="\t" inversions.circos.txt > inversions.circos.fixed.txt
+
+mv inversions.circos.fixed.txt inversions.circos.txt
+
+
+#### convert bed file to normalized density file 
+
+#!/bin/bash
+#SBATCH --job-name=Imp_normbed
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=04:00:00
+
+# -----------------------------
+# Load modules
+# -----------------------------
+ml bedtools/2.30.0
+
+# -----------------------------
+# Parameters
+# -----------------------------
+WINDOW=1000000
+GENOME_FILE="./genome.sizes"   # chromosome-only genome file
+OUTDIR="."
+VARIANT_DIR="./Variant"
+
+# -----------------------------
+# Make windows
+# -----------------------------
+bedtools makewindows -g $GENOME_FILE -w $WINDOW > $OUTDIR/windows.bed
+
+# -----------------------------
+# Calculate gene density
+# -----------------------------
+bedtools intersect -a $OUTDIR/windows.bed -b ./Gene/Impatiens_genes.bed -c > ./gene_density_${WINDOW}.bed
+
+# -----------------------------
+# Calculate TE density
+# -----------------------------
+bedtools intersect -a $OUTDIR/windows.bed -b ./TE/Impatiens_TE.bed -c > ./TE_density_${WINDOW}.bed
+
+# -----------------------------
+# Calculate SNP density
+# -----------------------------
+bedtools intersect -a $OUTDIR/windows.bed -b $VARIANT_DIR/circos_snps.txt -c > ./snp_density_${WINDOW}.bed
+
+# -----------------------------
+# Calculate INDEL density
+# -----------------------------
+bedtools intersect -a $OUTDIR/windows.bed -b $VARIANT_DIR/circos_indels.txt -c > ./indel_density_${WINDOW}.bed
+
+# -----------------------------
+# Normalize densities (0-1)
+# -----------------------------
+for f in $OUTDIR/*_density_${WINDOW}.bed; do
+    max=$(awk '{if($4>m)m=$4}END{print m}' $f)
+    awk -v max=$max '{print $1, $2, $3, $4, $4/max}' OFS="\t" $f > ${f%.bed}.norm.bed
+done
+
+# -----------------------------
+# Prepare Circos-ready bed files
+# -----------------------------
+for f in $OUTDIR/*norm.bed; do
+    awk '{print $1, $2, $3, $5}' OFS="\t" "$f" > "${f%.norm.bed}.circos.bed"
+done
+
+
+### gene synteny block from JCVI (Python implementation of MCscan)
+
+#### self comparison 
+
+#!/bin/bash
+#SBATCH --job-name=walleriana_self_synteny
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=200G
+#SBATCH --time=24:00:00
+#SBATCH --qos=xingbo.wu-b
+
+# Load Conda module
+ml conda
+
+# Make conda functions available in non-interactive shell
+source $(conda info --base)/etc/profile.d/conda.sh
+
+# Activate your environment
+conda activate /blue/xingbo.wu/jinli/.conda/envs/last_env
+
+# Load JCVI
+ml jcvi/1.2.10
+ml texlive/2023
+
+# Species
+S1="Impatiens_walleriana"
+
+echo "Running self-synteny for $S1..."
+
+# Step 1: Compute self-orthologs
+python -m jcvi.compara.catalog ortholog \
+    $S1 $S1 --cscore=.99 --no_strip_names
+
+# Step 2: Screen anchors
+python -m jcvi.compara.synteny screen \
+    --minspan=30 --simple \
+    ${S1}.${S1}.anchors ${S1}.${S1}.anchors.new
+
+echo "Self-synteny analysis for $S1 completed!"
+
+
+
+#### The .anchors.simple file was converted into a Circos-compatible format (synteny_links.txt)
+
+
+import pandas as pd
+
+# Read BED file
+bed = pd.read_csv("Impatiens_walleriana.bed", sep="\t", header=None, names=["chr","start","end","gene","score","strand"])
+
+# Merge duplicate genes: keep min start and max end
+bed_merged = bed.groupby("gene").agg({"chr":"first", "start":"min", "end":"max"}).reset_index()
+
+# Create dictionary
+gene_dict = bed_merged.set_index("gene")[["chr","start","end"]].to_dict("index")
+
+# Read anchors
+anchors = pd.read_csv("Impatiens_walleriana.Impatiens_walleriana.anchors.simple", sep="\t", header=None)
+
+links = []
+for idx, row in anchors.iterrows():
+    geneA = row[0]
+    geneB = row[2]
+    if geneA in gene_dict and geneB in gene_dict:
+        chrA = gene_dict[geneA]["chr"]
+        chrB = gene_dict[geneB]["chr"]
+        startA = gene_dict[geneA]["start"]
+        endA = gene_dict[geneA]["end"]
+        startB = gene_dict[geneB]["start"]
+        endB = gene_dict[geneB]["end"]
+        links.append([chrA, startA, endA, chrB, startB, endB])
+
+# Save links for circos plotting
+links_df = pd.DataFrame(links)
+links_df.to_csv("synteny_links.txt", sep="\t", header=False, index=False)
+
+
+
+#### circos.conf
+
+# Main configuration
+karyotype = karyotype.txt
+
+# Include housekeeping first
+<<include etc/housekeeping.conf>>
+
+<ideogram>
+    # Ideogram (chromosome) line
+    radius           = 0.95r
+    thickness        = 0p
+    fill             = no
+    stroke_color     = none
+    stroke_thickness = 0p
+
+    # Chromosome labels
+    show_label       = yes
+    label_font       = default
+    label_size       = 40
+    label_radius     = 0.95r
+
+    # Spacing between chromosomes
+    <spacing>
+        default = 0.005r
+    </spacing>
+</ideogram>
+
+# -------------------------------
+# Plots (wrap all <plot> blocks)
+# -------------------------------
+<plots>
+
+# -----------------
+# Gene density track
+<plot>
+type = heatmap
+file = ./gene_density_1000000.circos.bed
+r0   = 0.65r
+r1   = 0.75r
+col_values = 4
+use_col_values_for_rules = yes
+override_color = yes
+<rules>
+<rule>
+condition = var(value) <= 0.0964  
+color = 195, 232, 211
+</rule>
+<rule>
+condition = var(value) > 0.0964 && var(value) <= 0.2530
+color = 161, 214, 193
+</rule>
+<rule>
+condition = var(value) > 0.2530
+color = 116, 182, 161
+</rule>
+</rules>
+</plot>
+
+# TE density track
+<plot>
+type = heatmap
+file = ./TE_density_1000000.circos.bed
+r0   = 0.55r
+r1   = 0.65r
+col_values = 4
+use_col_values_for_rules = yes
+override_color = yes
+<rules>
+<rule>
+condition = var(value) <= 0.154
+color = 197, 163, 211
+</rule>
+<rule>
+condition = var(value) > 0.154 && var(value) <= 0.159
+color = 157, 123, 189
+</rule>
+<rule>
+condition = var(value) > 0.159
+color = 106, 79, 138
+</rule>
+</rules>
+</plot>
+
+# SNP density histogram
+
+<plot>
+type      = histogram
+file      = ./snp_density_1000000.bed
+r0        = 0.45r
+r1        = 0.53r
+thickness = 0p
+fill_color = 141,148,186	
+extend_bin = yes
+</plot>
+
+# INDEL density histogram
+
+<plot>
+type      = histogram
+file      = ./indel_density_1000000.bed
+r0        = 0.35r
+r1        = 0.43r
+thickness = 0p
+fill_color = 160,207,211
+extend_bin = yes
+</plot>
+
+# GC content line
+
+<plot>
+type      = line
+file      = ./Impatiens_GC_1000000.bed
+r0        = 0.75r
+r1        = 0.85r
+col       = 4
+color     = 0,56,123
+
+thickness = 4p
+fill_under = yes
+fill_color = 250,250,250    # color below the line
+
+min = 0
+max =50
+
+</plot>
+
+
+</plots>
+
+# -------------------------------
+# Links for synteny
+# -------------------------------
+<links>
+<link>
+
+
+file = ./synteny_links.txt
+radius = 0.33r
+bezier_radius = 0.1r
+color = 135,103,123
+thickness = 4p
+</link>
+</links>
+
+<image>
+    dir       = .
+    file      = circos_output.png
+    png       = no
+    svg       = yes
+    radius    = 1500
+    angle_offset = -90
+    width  = 3000
+    height = 3000
+</image>
+
+<<include colors_fonts_patterns.conf>>
+<<include ticks.conf>>
+
+
+#### tick.conf file
+
+ # Ticks
+    chromosomes_units = 1000000
+    show_ticks       = yes
+    show_tick_labels = yes
+
+    <ticks>
+        radius     = 0.86r   # just outside ideogram
+        multiplier = 1e-6        # convert bp → Mb
+        orientation= out
+        thickness  = 2p
+        color      = black
+        size       = 20p
+        tick_separation = 0p
+        label_separation = 0p
+        format       = %d
+
+        # Tick every 5 Mb
+        <tick>
+            spacing      = 5u
+            size         = 10p
+        </tick>
+
+        # Tick every 50 Mb
+        <tick>
+            spacing      = 50u
+            size         = 20p
+            show_label   = yes
+            label_size   = 35p
+            label_offset = 10p
+            color        = black
+            format       = %d
+        </tick>
+    </ticks>
+
+
+#### run circos
+
+circos -conf circos.conf
+
+
+
+
+#### JCVI (Python implementation of MCscan)
+
+### GTF to GFF3 to bed
+                                                                                                                  
+#!/bin/bash
+#SBATCH --job-name=imp_bed
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --time=10:00:00
+
+module load agat/1.4.2
+module load jcvi/1.2.10
+
+
+# List of genomes (replace with your actual files)
+GENOMES=("Impatiens_glandulifera" "Impatiens_noli-tangere" "Impatiens_parviflora" "Impatiens_walleriana")
+
+for GEN in "${GENOMES[@]}"; do
+    echo "Processing $GEN..."
+
+    # Step 1: Convert GTF to GFF3 using AGAT
+    agat_convert_sp_gxf2gxf.pl --gff "${GEN}.gtf" -o "${GEN}.gff3"
+
+    # Step 2: Generate BED file using JCVI (extract mRNA coordinates, gene names)
+    python -m jcvi.formats.gff bed --type=transcript --key=Name "${GEN}.gff3" -o "${GEN}.bed"
+
+    echo "$GEN done."
+done
+
+echo "All genomes processed!"
+
+
+
+### fix transcript ID if renamed by JCVI with fix_bed.sh
+
+#!/bin/bash
+
+# Directory where your BED files are
+BED_DIR="./gtf"
+# Directory where your GFF3 files are
+GFF_DIR="./gtf"
+
+# List of species (BED and GFF3 files)
+species=("Impatiens_glandulifera" "Impatiens_noli-tangere" "Impatiens_parviflora" "Impatiens_walleriana")
+
+for sp in "${species[@]}"; do
+    BED_FILE="${GFF_DIR}/${sp}.bed"
+    GFF_FILE="${GFF_DIR}/${sp}.gff3"
+    OUT_FILE="./${sp}.bed"
+
+    echo "Processing $sp ..."
+
+    awk -F'\t' 'BEGIN{
+        OFS="\t"
+    }
+    FNR==NR && $3=="transcript" {
+        # Store mRNA coords -> transcript_id
+        match($9,/ID=([^;]+)/,a)
+        key=$1":"$4":"$5
+        tid[key]=a[1]
+        next
+    }
+    FNR!=NR {
+        # BED: convert start to 1-based for lookup
+        key=$1":"$2+1":"$3
+        if(key in tid) {
+            $4=tid[key]
+        }
+        print
+    }' "$GFF_FILE" "$BED_FILE" > "$OUT_FILE"
+
+    echo "Saved corrected BED to $OUT_FILE"
+done
+
+
+### JCVI MCscanX
+
+#!/bin/bash
+#SBATCH --job-name=jcvi_impatiens
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=200G
+#SBATCH --time=24:00:00
+#SBATCH --qos=xingbo.wu-b
+
+ml jcvi/1.2.10
+module load texlive/2023
+source activate /blue/xingbo.wu/jinli/.conda/envs/last_env
+
+# Species in desired order
+S1="Impatiens_walleriana"
+S2="Impatiens_noli-tangere"
+S3="Impatiens_parviflora"
+S4="Impatiens_glandulifera"
+
+python -m jcvi.compara.catalog ortholog \
+    $S1 $S2 --cscore=.99 --no_strip_names
+python -m jcvi.compara.synteny screen \
+    --minspan=30 --simple \
+    ${S1}.${S2}.anchors ${S1}.${S2}.anchors.new
+
+python -m jcvi.compara.catalog ortholog \
+    $S2 $S3 --cscore=.99 --no_strip_names
+python -m jcvi.compara.synteny screen \
+    --minspan=30 --simple \
+    ${S2}.${S3}.anchors ${S2}.${S3}.anchors.new
+
+python -m jcvi.compara.catalog ortholog \
+    $S3 $S4 --cscore=.99 --no_strip_names
+python -m jcvi.compara.synteny screen \
+    --minspan=30 --simple \
+    ${S3}.${S4}.anchors ${S3}.${S4}.anchors.new
+
+
+
+
+
+### make seqids file with make_seqids.sh (determine species and chromosome order)
+
+#!/bin/bash
+
+# BED files
+beds=("Impatiens_walleriana.bed" "Impatiens_noli-tangere.bed" "Impatiens_parviflora.bed" "Impatiens_glandulifera.bed")
+
+# Output seqids file
+out="seqids"
+
+> "$out"  # empty file
+
+for bed in "${beds[@]}"; do
+    # Extract unique chromosome names in order
+    awk '{print $1}' "$bed" | awk '!seen[$0]++' | paste -sd ',' - >> "$out"
+done
+
+
+#### bash counts syntenic gene block pairs between chromosomes of two species
+
+#!/bin/bash
+# Usage: bash match_chr.sh species1.bed species2.bed anchors.simple
+
+BED1=$1
+BED2=$2
+SIMPLE=$3
+
+awk '
+# ARGIND: 1=first file, 2=second file, 3=third file
+
+ARGIND==1 { bed1[$4]=$1; next }   # species1: geneID -> chromosome
+ARGIND==2 { bed2[$4]=$1; next }   # species2: geneID -> chromosome
+
+ARGIND==3 {
+    geneA=$1; geneB=$2; geneC=$3; geneD=$4
+    # make sure all genes exist in BEDs
+    if(geneA in bed1 && geneB in bed1 && geneC in bed2 && geneD in bed2) {
+        chr1 = bed1[geneA]
+        chr2 = bed2[geneC]
+        count[chr1"\t"chr2]++
+    }
+}
+END {
+    print "#Count\tSpecies1_chr\tSpecies2_chr"
+    for(k in count) print count[k], k
+}' $BED1 $BED2 $SIMPLE | sort -nr
+
+
+#### final seqids file 
+
+Iw_1,Iw_2,Iw_3,Iw_4,Iw_5,Iw_6,Iw_7,Iw_8
+OZ243896.1_chromosome,OZ243899.1_chromosome,OZ243897.1_chromosome,OZ243892.1_chromosome,OZ243900.1_chromosome,OZ243898.1_chromosome,OZ243893.1_chromosome,OZ243895.1_chromosome,OZ243894.1_chromosome,OZ243891.1_chromosome
+OZ218206.1_chromosome,OZ218207.1_chromosome,OZ218205.1_chromosome,OZ218211.1_chromosome,OZ218216.1_chromosome,OZ218209.1_chromosome,OZ218204.1_chromosome,OZ218213.1_chromosome,OZ218212.1_chromosome,OZ218215.1_chromosome,OZ218210.1_chromosome,OZ218214.1_chromosome,OZ218208.1_chromosome
+NC_061862.1_chromosome,NC_061869.1_chromosome,NC_061866.1_chromosome,NC_061867.1_chromosome,NC_061865.1_chromosome,NC_061870.1_chromosome,NC_061864.1_chromosome,NC_061868.1_chromosome,NC_061863.1_chromosome
+
+
+### layout file (no blank line before # edge!)
+
+# y, xstart, xend, rotation, color, label, va, bed
+0.9,0.1,0.9,0, ,Impatiens_walleriana,top,Impatiens_walleriana.bed
+0.7,0.1,0.9,0, ,Impatiens_noli-tangere,top,Impatiens_noli-tangere.bed
+0.5,0.1,0.9,0, ,Impatiens_parviflora,top,Impatiens_parviflora.bed
+0.3,0.1,0.9,0, ,Impatiens_glandulifera,top,Impatiens_glandulifera.bed
+# edges (pairwise order)
+e,0,1,Impatiens_walleriana.Impatiens_noli-tangere.anchors.simple
+e,1,2,Impatiens_noli-tangere.Impatiens_parviflora.anchors.simple
+e,2,3,Impatiens_parviflora.Impatiens_glandulifera.anchors.simple
+
+
+
+### plot jcvi result
+
+module load texlive/2023
+ml jcvi/1.2.10
+
+python -m jcvi.graphics.karyotype seqids layout \
+    --figsize 6x5 \
+    --dpi 3000 \
+    --font Helvetica \
+    --format=png \
+    --nocircles 
+
+
+
+
+#### annotation 
+
+#### InterProScan (need to remove * in .faa) and SwissProt BLAST
+
+for f in Impatiens_glandulifera.fasta Impatiens_noli-tangere.fasta Impatiens_parviflora.fasta Impatiens_walleriana.fasta; do
+    species=$(basename "$f" .fasta)  # get species name from filename
+    awk -v sp="$species" '/^>/{print ">"sp"_"substr($0,2); next} {gsub(/\*/,""); print}' "$f" > "${species}_prefixed.fasta"
+done
+
+#### run
+
+#!/bin/bash
+#SBATCH --job-name=annotation
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --time=4-00:00:00
+#SBATCH --cpus-per-task=20
+#SBATCH --mem=200G
+
+# -----------------------------
+# Load InterProScan module
+# -----------------------------
+module load iprscan/5.75-106.0
+
+# -----------------------------
+# Set BLAST path (manual installation)
+# -----------------------------
+export PATH=/apps/blast/ncbi/2.2.31/bin:$PATH
+
+# -----------------------------
+# Output folder
+# -----------------------------
+OUTDIR=annotation
+mkdir -p $OUTDIR
+
+# -----------------------------
+# SwissProt database setup
+# -----------------------------
+
+DBDIR=/blue/xingbo.wu/jinli/blastdb
+mkdir -p $DBDIR
+
+# Download SwissProt if not exists
+if [ ! -f $DBDIR/uniprot_sprot ]; then
+    if [ ! -f $DBDIR/uniprot_sprot.fasta ]; then
+        echo "Downloading SwissProt..."
+        wget -P $DBDIR ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
+        gunzip $DBDIR/uniprot_sprot.fasta.gz
+    fi
+    echo "Formatting SwissProt BLAST database..."
+    makeblastdb -in $DBDIR/uniprot_sprot.fasta -dbtype prot -out $DBDIR/uniprot_sprot
+fi
+
+SWISS=$DBDIR/uniprot_sprot
+
+# -----------------------------
+# List of protein FASTA files
+# -----------------------------
+PROTEINS=("Impatiens_glandulifera.fasta" "Impatiens_noli-tangere.fasta" \
+          "Impatiens_parviflora.fasta" "Impatiens_walleriana.fasta")
+
+# -----------------------------
+# Loop over each species
+# -----------------------------
+for PROTEIN in "${PROTEINS[@]}"; do
+    SPECIES=$(basename "$PROTEIN" .fasta)
+    echo "=== Annotating $SPECIES ==="
+
+    # Create subdirectory for this species
+    mkdir -p $OUTDIR/$SPECIES
+
+    #############################
+    # 1. InterProScan
+    #############################
+    echo "Running InterProScan for $SPECIES..."
+    interproscan.sh \
+    	    -i $PROTEIN \
+    	    -f TSV,XML,GFF3 \
+    	    -dp \
+    	    -cpu 20 \
+    	    -d $OUTDIR/$SPECIES
+
+    #############################
+    # 2. BLASTP to SwissProt
+    #############################
+    echo "Running BLASTP to SwissProt for $SPECIES..."
+    blastp -query $PROTEIN \
+           -db $SWISS \
+           -out $OUTDIR/$SPECIES/blast_swissprot.out \
+           -outfmt 6 \
+           -evalue 1e-5 \
+           -num_threads 20
+
+    echo "=== Finished $SPECIES ==="
+done
+
+echo "All species annotation done!"
+
+
+
+#### KEGG annotation (KAAS Job, https://www.genome.jp/kaas-bin/kaas_main)
+
+### Functional annotation of predicted genes was performed using KAAS with the plant dataset in the BBH (bi-directional best hit) method, using most available eudicot reference species, including representatives from Asterids, Rosids, and other core eudicot lineages, for KEGG Orthology assignment (test)
+
+Asterids
+
+Solanum lycopersicum
+Solanum pennellii
+Nicotiana tabacum
+Nicotiana tomentosiformis
+Ipomoea nil
+Olea europaea var. sylvestris
+Helianthus annuus
+Lactuca sativa
+
+sly, spen, nta, nto, ini, oeu, han, lsv
+
+Brassicaceae
+
+Arabidopsis thaliana
+Brassica rapa
+Brassica oleracea
+Capsella rubella
+Brassica napus
+
+ath, brp, boe, crb, bna
+
+Malvaceae
+
+Theobroma cacao
+Gossypium hirsutum
+Gossypium arboreum
+Durio zibethinus
+
+tcc, ghi, gab, dzi
+
+Fabaceae
+
+Glycine max
+Medicago truncatula
+Arachis duranensis
+Vigna unguiculata
+Lupinus angustifolius
+Lotus japonicus
+
+gmx, mtr, adu, vun, lang, lja
+
+Rosaceae
+
+Fragaria vesca
+Prunus persica
+Malus domestica
+
+fve, pper, mdm
+
+Capparaceae
+
+Tarenaya hassleriana
+
+thj
+
+Caricaceae
+
+Carica papaya
+
+cpap
+
+Rutaceae
+
+Citrus sinensis
+
+cit
+
+Amaranthaceae
+
+Beta vulgaris
+Chenopodium quinoa
+
+bvg, cqi
+
+Papaveraceae
+
+Papaver somniferum
+
+psom
+
+Cucurbitaceae
+
+Cucumis sativus
+Cucumis melo
+Cucurbita maxima
+
+csv, cmo, cmax 
+
+Euphorbiaceae
+
+Ricinus communis
+Manihot esculenta
+
+rcu, mesc
+
+Salicaceae
+
+Populus trichocarpa
+
+pop
+
+Juglandaceae
+
+Juglans regia
+
+jre
+
+Fagaceae
+
+Quercus suber
+
+qsu
+
+sly, spen, nta, nto, ini, oeu, han, lsv, ath, brp, boe, crb, bna, tcc, ghi, gab, dzi, gmx, mtr, adu, vun, lang, lja, fve, pper, mdm, thj, cpap, cit, bvg, cqi, psom, csv, cmo, cmax, rcu, mesc, pop, jre, qsu
+
+
+
+#### eggnog-mapper annotation - eggNOG database (version 5.0.2)
+
+
+#!/bin/bash
+#SBATCH --job-name=eggnog_annotation
+#SBATCH --output=logs/eggnog_%x_%A_%a.log
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=100G
+#SBATCH --time=48:00:00
+#SBATCH --array=0-3
+#SBATCH --qos=xingbo.wu-b
+
+
+# Save current working directory
+WORKDIR=$(pwd)
+
+module load eggnog-mapper/2.1.6
+
+###############################################
+# Array of FASTA files
+###############################################
+FASTA_FILES=(
+    "Impatiens_glandulifera.fasta"
+    "Impatiens_noli-tangere.fasta"
+    "Impatiens_parviflora.fasta"
+    "Impatiens_walleriana.fasta"
+)
+
+FASTA="${FASTA_FILES[$SLURM_ARRAY_TASK_ID]}"
+BASENAME=$(basename "$FASTA" .fasta)
+
+###############################################
+# Run EggNOG-mapper
+###############################################
+emapper.py \
+    -i "$FASTA" \
+    --itype proteins \
+    --cpu 16 \
+    -o "${BASENAME}_eggnog" \
+    --output_dir "eggnog_results" \
+    --go_evidence all \
+    --target_orthologs all
+
+
+#### KEGG gene finder (A Bash script to extract genes from Orthogroups.tsv for specified species and orthogroup lists)
+
+#!/bin/bash
+
+# Usage:
+# bash gene_finder.sh Orthogroups.tsv "Impatiens_walleriana_modified_longest_isoform" expanded_family.txt output.txt
+
+set -euo pipefail
+
+orthogroup_file=$1
+species_name=$2
+family_list=$3
+output_file=$4
+
+# Check input files exist
+if [[ ! -f "$orthogroup_file" ]]; then
+    echo "Error: Orthogroup file '$orthogroup_file' not found."
+    exit 1
+fi
+
+if [[ ! -f "$family_list" ]]; then
+    echo "Error: Family list file '$family_list' not found."
+    exit 1
+fi
+
+# Convert DOS line endings to Unix
+dos2unix "$orthogroup_file" "$family_list"
+
+# Find column number for the species (1-based)
+col=$(head -1 "$orthogroup_file" | tr -s ' ' '\t' | tr '\t' '\n' | grep -n "^$species_name$" | cut -d':' -f1)
+
+if [[ -z "$col" ]]; then
+    echo "Error: Species column '$species_name' not found in header."
+    exit 1
+fi
+
+echo "Species column '$species_name' found at column $col."
+
+# Make output file empty
+> "$output_file"
+
+# Read each orthogroup from the family list (handle Windows line endings)
+while IFS=$'\r\n' read -r og; do
+    [[ -z "$og" ]] && continue  # skip empty lines
+
+    awk -F'\t' -v col="$col" -v og="$og" '
+    $1 == og {
+        # replace commas with space, then split on spaces
+        gsub(/,/, " ", $col)
+        n = split($col, genes, /[ ]+/)
+        for (i=1; i<=n; i++) {
+            gsub(/^ +| +$/,"",genes[i])   # trim spaces
+            if (genes[i] != "") print genes[i]
+        }
+    }' "$orthogroup_file" >> "$output_file"
+
+done < "$family_list"
+
+echo "Done! Genes written to: $output_file"
+
+
+
+#### KEGG enrichment plot (expanded contracted genes)
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(grid)
+
+# --- Read data ---
+expanded <- read.table("Expanded_TBtools.KEGG.enrichment.result.xls.final.xls",
+                       header = TRUE, sep = "\t")
+contracted <- read.table("Contracted_TBtools.KEGG.enrichment.result.xls.final.xls",
+                         header = TRUE, sep = "\t")
+
+# --- Filter adjusted P-value and keep top 8 ---
+expanded <- expanded %>%
+  filter(adjP <= 0.05) %>%
+  arrange(desc(enrichFactor)) %>%
+  head(8)
+
+contracted <- contracted %>%
+  filter(adjP <= 0.05) %>%
+  arrange(desc(enrichFactor)) %>%
+  head(8)
+
+# --- Shared limits for consistent scales ---
+x_min <- min(c(expanded$enrichFactor, contracted$enrichFactor)) - 0.02
+x_max <- max(c(expanded$enrichFactor, contracted$enrichFactor))
+fill_min <- min(c(expanded$adjP, contracted$adjP))
+fill_max <- max(c(expanded$adjP, contracted$adjP))
+size_min <- min(c(expanded$GeneHitsInSelectedSet, contracted$GeneHitsInSelectedSet))
+size_max <- max(c(expanded$GeneHitsInSelectedSet, contracted$GeneHitsInSelectedSet))
+
+# --- Top plot: Expanded ---
+p1 <- ggplot(expanded, aes(x = enrichFactor, y = reorder(Term.Name, enrichFactor),
+                           size = GeneHitsInSelectedSet, fill = adjP)) +
+  geom_point(shape = 21, color = "#6A4F8A", stroke = 2) +
+  scale_fill_gradient(high = "#C5A3D3", low = "#6A4F8A",
+                      limits = c(fill_min, fill_max)) +
+  scale_size_continuous(range = c(5, 28),
+                        limits = c(size_min, size_max)) +
+  scale_x_continuous(limits = c(x_min, x_max)) +
+  guides(
+    fill = guide_colorbar(order = 1, label.hjust = 0),   # shift text slightly
+    size = guide_legend(order = 2)
+  ) +
+  theme_linedraw() +
+  theme(
+    axis.title.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text = element_text(size = 50),
+    axis.text.y = element_text(size = 55, margin = margin(r = 10)),
+    plot.margin = margin(t = 5, r = 100, b = 0, l = 5),
+    legend.position = "right",
+    legend.title = element_text(size = 50, margin = margin(b = 20)),
+    legend.text = element_text(size = 50, margin = margin(l = 10)), # added left margin
+    legend.key.height = unit(3.5, "lines"),
+    legend.key.width = unit(1.8, "lines"),
+    legend.spacing.y = unit(1.5, "lines"),
+    legend.box.spacing = unit(1.5, "lines")
+  ) +
+  labs(fill = "q-value", size = "Gene number")
+
+# --- Bottom plot: Contracted ---
+p2 <- ggplot(contracted, aes(x = enrichFactor, y = reorder(Term.Name, enrichFactor),
+                             size = GeneHitsInSelectedSet, fill = adjP)) +
+  geom_point(shape = 21, color = "#74B6A1", stroke = 2) +
+  scale_fill_gradient(high = "#C3E8D3", low = "#74B6A1",
+                      limits = c(fill_min, fill_max)) +
+  scale_size_continuous(range = c(5, 28),
+                        limits = c(size_min, size_max)) +
+  scale_x_continuous(limits = c(x_min, x_max)) +
+  guides(
+    fill = guide_colorbar(order = 1, label.hjust = 0),
+    size = guide_legend(order = 2)
+  ) +
+  theme_linedraw() +
+  theme(
+    axis.title.x = element_text(size = 50, margin = margin(t = 10)),
+    axis.title.y = element_blank(),
+    axis.text = element_text(size = 50),
+    axis.text.y = element_text(size = 55, margin = margin(r = 10)),
+    plot.margin = margin(t = 0, r = 100, b = 5, l = 5),
+    legend.position = "right",
+    legend.title = element_text(size = 45, margin = margin(b = 15)),
+    legend.text = element_text(size = 45, margin = margin(l = 10)), # shift text
+    legend.key.height = unit(3, "lines"),
+    legend.key.width = unit(1.8, "lines"),
+    legend.spacing.y = unit(1, "lines"),
+    legend.box.spacing = unit(1.5, "lines")
+  ) +
+  labs(x = "EnrichFactor", fill = "q-value", size = "Gene number")
+
+# --- Combine plots with shared legend ---
+p_combined <- p1 / p2 +
+  plot_layout(heights = c(1, 1), guides = "collect") +
+  plot_annotation(
+    theme = theme(
+      plot.title = element_text(size = 50, hjust = 0.5, face = "bold", margin = margin(b = 20)),
+      legend.position = "right"
+    )
+  )
+
+# --- Save figure ---
+ggsave("KEGG_expanded_contracted_genes_enrichment_aligned_legend.tiff",
+       plot = p_combined, width = 34, height = 22, dpi = 800)
+
+
+#### Impatiens walleriana unique genes KEGG enrichment 
+
+library(ggplot2)
+library(dplyr)
+
+# --- Read data ---
+df <- read.table("IW_unique_TBtools.KEGG.enrichment.result.xls.final.xls",
+                 header = TRUE, sep = "\t")
+
+# --- Keep top 15 significant terms ---
+df_top <- df %>% 
+    filter(adjP <= 0.01) %>% 
+    arrange(desc(enrichFactor)) %>% 
+    head(15)
+
+# --- Replace adjP == 0 with tiny number (optional) ---
+min_nonzero <- min(df_top$adjP[df_top$adjP > 0])
+df_top$adjP[df_top$adjP == 0] <- min_nonzero / 10
+
+# --- Shared limits ---
+x_min <- min(df_top$enrichFactor) - 0.02
+x_max <- max(df_top$enrichFactor)
+
+# --- Plot ---
+p <- ggplot(df_top, aes(x = enrichFactor,
+                        y = reorder(Term.Name, enrichFactor),
+                        size = GeneHitsInSelectedSet,
+                        fill = adjP)) +
+    geom_point(shape = 21, color = "#6A4F8A", stroke = 2) +
+    
+    # ---- Linear color gradient (fix legend) ----
+    scale_fill_gradient(
+        low  = "#6A4F8A",
+        high = "#E9DDF0",
+        name = "q-value"
+    ) +
+    
+    # ---- Show x-axis ----
+    scale_x_continuous(
+        limits = c(x_min, x_max),
+        name = "Enrichment Factor",
+        expand = c(0.02, 0.02)
+    ) +
+
+    scale_size_continuous(range = c(5, 28)) +
+
+    theme_linedraw() +
+    theme(
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 55, margin = margin(r = 10)),
+        axis.title.x = element_text(size = 55),
+        axis.text.x = element_text(size = 55),
+        
+        # ---- Legend Styling (larger) ----
+        legend.title = element_text(size = 50, margin = margin(b = 15)),
+        legend.text = element_text(size = 50),
+        legend.key.height = unit(4, "lines"),
+        legend.key.width  = unit(3, "lines"),
+        legend.box.margin = margin(20, 20, 20, 20),
+        legend.spacing.y  = unit(2, "lines"),
+        legend.spacing.x  = unit(1.5, "lines")
+    ) +
+    labs(size = "Gene number")
+
+# --- Save figure ---
+ggsave("KEGG_IW_unique_top15_enrichment_linear.tiff",
+       plot = p, width = 34, height = 22, dpi = 800)
+
+
+#### Core gene enrichment plot
+
+library(ggplot2)
+library(dplyr)
+library(scales)  # for rescale()
+
+# --- Read data ---
+df <- read.table("Core_TBtools.KEGG.enrichment.result.xls.final.xls",
+                 header = TRUE, sep = "\t")
+
+# --- Keep top 15 significant terms ---
+df_top <- df %>% 
+    filter(adjP <= 0.01) %>% 
+    arrange(desc(enrichFactor)) %>% 
+    head(15)
+
+# --- Replace adjP == 0 with tiny number (needed for color scale) ---
+min_nonzero <- min(df_top$adjP[df_top$adjP > 0])
+df_top$adjP[df_top$adjP == 0] <- min_nonzero / 10
+
+# --- Limits ---
+x_min <- min(df_top$enrichFactor) - 0.02
+x_max <- max(df_top$enrichFactor)
+size_min <- min(df_top$GeneHitsInSelectedSet)
+size_max <- max(df_top$GeneHitsInSelectedSet)
+
+# --- Define three x-axis ticks ---
+x_breaks <- c(round(x_min, 2), round((x_min + x_max)/2, 2), round(x_max, 2))
+
+# --- Plot ---
+p <- ggplot(df_top, aes(x = enrichFactor,
+                        y = reorder(Term.Name, enrichFactor),
+                        size = GeneHitsInSelectedSet,
+                        fill = adjP)) +
+    geom_point(shape = 21, 
+               color = "#74B6A1",  # circle outline
+               stroke = 2) +
+
+    # ---- q-value color scale with more distinct green palette ----
+    scale_fill_gradientn(
+        colors = c("#C3E8D3", "#9ED7BF", "#74B6A1", "#32775B"),  # low → mid → high
+        values = rescale(quantile(df_top$adjP, probs = c(0, 0.33, 0.66, 1))),
+        name = "q-value"
+    ) +
+
+    # ---- x-axis with three ticks ----
+    scale_x_continuous(
+        limits = c(x_min, x_max),
+        breaks = x_breaks,
+        name = "Enrichment Factor"
+    ) +
+
+    # ---- size scale ----
+    scale_size_continuous(range = c(5, 28), name = "Gene number") +
+
+    # ---- Theme & legend styling ----
+    theme_linedraw() +
+    theme(
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 55, margin = margin(r = 10)),
+        axis.title.x = element_text(size = 55),
+        axis.text.x = element_text(size = 55),
+
+        # ---- Legends: q-value above Gene number ----
+        legend.position = "right",
+        legend.box = "vertical",
+        legend.title = element_text(size = 50, margin = margin(b = 30)),  # move title away
+        legend.text = element_text(size = 50),
+        legend.key.height = unit(4, "lines"),
+        legend.key.width  = unit(3, "lines"),
+        legend.spacing.y  = unit(2, "lines")
+    )
+
+# --- Save figure ---
+ggsave("KEGG_Core_top15_enrichment.tiff",
+       plot = p, width = 34, height = 22, dpi = 800)
+
+
+#### parviflora glandulifera cluster expanded gene pathways  
+
+library(ggplot2)
+library(dplyr)
+library(scales)  # for rescale()
+library(grid)    # for unit()
+
+# --- Read data ---
+df <- read.table("TBtools.KEGG.enrichment.result.xls.final.xls",
+                 header = TRUE, sep = "\t")
+
+# --- Keep top 15 significant terms ---
+df_top <- df %>% 
+    filter(adjP <= 0.01) %>% 
+    arrange(desc(enrichFactor)) %>% 
+    head(15)
+
+# --- Replace adjP == 0 with tiny number to avoid -Inf ---
+min_nonzero <- min(df_top$adjP[df_top$adjP > 0])
+df_top$adjP[df_top$adjP == 0] <- min_nonzero / 10
+
+# --- Transform adjP for coloring ---
+df_top$log_adjP <- -log10(df_top$adjP)
+
+# --- Limits ---
+x_min <- min(df_top$enrichFactor) - 0.02
+x_max <- max(df_top$enrichFactor)
+
+# --- Define three x-axis ticks ---
+x_breaks <- c(round(x_min, 2), round((x_min + x_max)/2, 2), round(x_max, 2))
+
+# --- Plot ---
+p <- ggplot(df_top, aes(x = enrichFactor,
+                        y = reorder(Term.Name, enrichFactor),
+                        size = GeneHitsInSelectedSet,
+                        fill = log_adjP)) +
+    geom_point(shape = 21, 
+               color = "#74B6A1",  # circle outline
+               stroke = 2) +
+
+    # ---- Linear color scale on -log10(adjP) ----
+    scale_fill_gradient(
+        low  = "#C3E8D3",  # less significant → light
+        high = "#32775B",  # more significant → dark
+        name = "-log10(q-value)"
+    ) +
+
+    # ---- x-axis with three ticks ----
+    scale_x_continuous(
+        limits = c(x_min, x_max),
+        breaks = x_breaks,
+        name = "Enrichment Factor"
+    ) +
+
+    # ---- size scale ----
+    scale_size_continuous(range = c(5, 28), name = "Gene number") +
+
+    # ---- Theme & legend styling ----
+    theme_linedraw() +
+    theme(
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 55, margin = margin(r = 10)),
+        axis.title.x = element_text(size = 55),
+        axis.text.x = element_text(size = 55),
+
+        legend.position = "right",
+        legend.box = "vertical",
+        legend.title = element_text(size = 50, margin = margin(b = 30)),
+        legend.text = element_text(size = 50),
+        legend.key.height = unit(4, "lines"),
+        legend.key.width  = unit(3, "lines"),
+        legend.spacing.y  = unit(2, "lines")
+    )
+
+# --- Save figure ---
+ggsave("KEGG_parve_glan_expanded_top15_enrichment.tiff",
+       plot = p, width = 34, height = 22, dpi = 800)
+
+
+
+
+
+
+############ Gene analyses (Anthocyanin biosynthesis)
+
+#### extract_genes_OG_KO.py (put ko of interest in ko.txt, extract genes from eggNOG annotation and retrieve OG number from Orthogroups.tsv)
+
+#!/usr/bin/env python3
+import pandas as pd
+import glob
+
+# -------- Parameters --------
+GENE_PATTERNS = "ko.txt"          # file with patterns to search, one per line
+ANNOT_PATTERN = "*_eggnog.emapper.annotations"
+ORTHOFILE = "Orthogroups.tsv"
+OUTPUT = "genes_OG_table.tsv"
+
+# -------- Step 1: Load gene patterns --------
+with open(GENE_PATTERNS) as f:
+    patterns = [line.strip() for line in f if line.strip()]
+print(f"Loaded {len(patterns)} patterns to search.")
+
+# -------- Step 2: Build gene -> OG mapping --------
+orthos = pd.read_csv(ORTHOFILE, sep="\t")
+gene2OG = {}
+for idx, row in orthos.iterrows():
+    OG = row.iloc[0]
+    for col in row[1:]:
+        if pd.notna(col):
+            for gene in str(col).split(","):  # handle multiple genes per cell
+                gene2OG[gene.strip()] = OG  # keep full gene ID with species
+print(f"Mapped {len(gene2OG)} genes to OGs.")
+
+# -------- Step 3: Search annotation files --------
+results = []
+for annot_file in glob.glob(ANNOT_PATTERN):
+    species = annot_file.split("_eggnog")[0]
+    print(f"Processing {species}...")
+
+    with open(annot_file) as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            for pattern in patterns:
+                if pattern in line:
+                    gene_name = line.strip().split("\t")[0]  # keep full gene ID
+                    OG = gene2OG.get(gene_name, "NA")        # lookup using full gene ID
+                    results.append([gene_name, OG, pattern])
+                    break  # stop after first pattern match per line
+
+# -------- Step 4: Save results --------
+if results:
+    df = pd.DataFrame(results, columns=["Gene_name", "OG_number", "Pattern"])
+    df.to_csv(OUTPUT, sep="\t", index=False)
+    print(f"Done! {len(results)} rows saved to {OUTPUT}")
+else:
+    print("No matches found.")
+
+
+#### generate_OG_count_table.py (make OG count table)
+
+#!/usr/bin/env python3
+import pandas as pd
+
+# -------- Parameters --------
+INPUT = "genes_OG_table.tsv"   # your gene-level table
+OUTPUT = "OG_count_table.tsv"  # output OG x species count table
+
+# -------- Step 1: Load gene table --------
+df = pd.read_csv(INPUT, sep="\t")
+print(f"Loaded {len(df)} rows from {INPUT}")
+
+# -------- Step 2: Extract species from Gene_name --------
+# Assuming format: gene_id|species
+df['Species'] = df['Gene_name'].apply(lambda x: x.split("|")[1] if "|" in x else x)
+
+# -------- Step 3: Group by OG and Species to count genes --------
+count_df = df.groupby(['OG_number', 'Species']).size().reset_index(name='Count')
+
+# -------- Step 4: Pivot table to have species as columns --------
+og_table = count_df.pivot(index='OG_number', columns='Species', values='Count').fillna(0).astype(int)
+
+# Optional: sort rows and columns
+og_table = og_table.sort_index()
+og_table = og_table.reindex(sorted(og_table.columns), axis=1)
+
+# -------- Step 5: Save to file --------
+og_table.to_csv(OUTPUT, sep="\t")
+print(f"OG count table saved to {OUTPUT}")
+
+
+#### seqkit extract proteins of interest with gene names in gene_id
+
+#!/bin/bash
+#SBATCH --job-name=extract_protein
+#SBATCH --time=01:00:00
+#SBATCH --mem=4G
+#SBATCH --cpus-per-task=2
+
+# Load seqkit module if needed (adjust for your HPC)
+module load seqkit
+
+# Input files
+GENE_LIST="gene_id"
+FASTA="../../Proteins/all_modified.fasta"
+OUTPUT="proteins.fasta"
+
+# Extract sequences
+seqkit grep -f $GENE_LIST $FASTA > $OUTPUT
+
+echo "Extraction done. Output saved to $OUTPUT"
+
+
+#### construct gene tree 
+
+#!/bin/bash
+#SBATCH --job-name=gene_tree
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=23:00:00
+
+# -----------------------------
+# Load required modules
+# -----------------------------
+module load mafft/7.520
+#module load gblocks/0.91b
+module load iq-tree/2.2.2.7
+
+
+# -----------------------------
+# Step 0: Add species abbreviation to headers
+# -----------------------------
+
+# -----------------------------
+# Step 1: MAFFT multiple sequence alignment
+# -----------------------------
+echo "Starting MAFFT alignment..."
+mafft --auto --thread 8 proteins.fasta > proteins_aligned.fasta
+echo "MAFFT alignment completed."
+
+# -----------------------------
+# Step 2: Convert to single-line sequences
+# -----------------------------
+# change to single line
+awk '/^>/{if(seq){print seq} print; seq=""; next} {gsub(" ",""); seq=seq $0} END{print seq}' proteins_aligned.fasta > proteins_aligned_singleline.fasta
+
+# -----------------------------
+# Step 3: Build Maximum Likelihood tree with IQ-TREE
+# -----------------------------
+echo "Starting IQ-TREE..."
+iqtree2 -s proteins_aligned_singleline.fasta -m MFP -bb 1000 -alrt 1000 -nt AUTO
+echo "IQ-TREE finished. Tree and log files are ready."
+
+
+
+#### construct gene tree (mafft trimal iqtree)
+
+#!/bin/bash
+#SBATCH --job-name=gene_tree
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=32G
+#SBATCH --time=23:00:00
+
+# -----------------------------
+# Load required modules
+# -----------------------------
+module load mafft/7.520
+module load trimal/1.4.1
+module load iq-tree/2.2.2.7
+
+# -----------------------------
+# Input / Output files
+# -----------------------------
+INPUT_FASTA="proteins.fasta"
+ALIGN_FASTA="proteins_aligned.fasta"
+TRIM_FASTA="proteins_aligned_trimmed.fasta"
+
+# -----------------------------
+# Step 1: Multiple sequence alignment
+# -----------------------------
+echo "[$(date)] Running MAFFT..."
+mafft --auto --thread ${SLURM_CPUS_PER_TASK} ${INPUT_FASTA} > ${ALIGN_FASTA}
+echo "[$(date)] MAFFT alignment finished."
+
+# -----------------------------
+# Step 2: Trim poorly aligned regions
+# -----------------------------
+echo "[$(date)] Running trimAl..."
+trimal -automated1 \
+  -in ${ALIGN_FASTA} \
+  -out ${TRIM_FASTA}
+echo "[$(date)] trimAl finished."
+
+# -----------------------------
+# Step 3: Build ML gene tree
+# -----------------------------
+echo "[$(date)] Running IQ-TREE..."
+iqtree2 \
+  -s ${TRIM_FASTA} \
+  -m MFP \
+  -bb 1000 \
+  -alrt 1000 \
+  -nt AUTO
+echo "[$(date)] IQ-TREE finished."
+
+# -----------------------------
+# Done
+# -----------------------------
+echo "[$(date)] Gene tree pipeline completed successfully."
+
+
+
+
+
+
+#### Microsynteny gene level 
+
+#### make combine bed file
+
+cat Impatiens_walleriana.bed Impatiens_noli-tangere.bed > wallerian_noli.bed
+
+## keep only a specific genomic region of interest 
+
+#### make blocks_ordered file 
+
+.       g20500.t1
+g3755.t1        g20499.t2
+g3756.t1        g20499.t2
+g3758.t1        g20499.t2
+.       g20497.t1
+
+#### make blocks.layout file 
+
+# x,   y, rotation, ha,     va,     color, ratio, label
+0.6, 0.8, 0, left, center, black, 0.5, \it I. walleriana Iw_1
+0.6, 0.6, 0, left, center, black, 0.5, \it I. noli-tangere OZ243899.1
+# edges
+e, 0, 1
+
+#### run jcvi
+
+ml jcvi/1.2.10
+ml texlive/2023
+
+python -m jcvi.graphics.synteny blocks_ordered four_species_filtered.bed blocks.layout --genelabelsize=10 --glyphcolor=orthogroup --genelabels=g3755.t1,g3756.t1,g3758.t1,g20499.t2 --dpi=3000 --format=png
+
+python -m jcvi.graphics.synteny blocks_ordered combined.bed blocks.layout --genelabelsize=10 --glyphcolor=orthogroup --genelabels=g7217.t1,g12860.t1,g12861.t1,g12862.t1,g12863.t1 --dpi=3000 --format=png
+
+
+
+#### plot gene count heatmap 
+
+### Anthocyanin 
+
+# -------------------------------
+# Heatmap with Italicized Species Names and Smaller Scale Bar
+# -------------------------------
+
+library(pheatmap)
+library(grid)
+
+# 1. Read TSV data
+count_df <- read.table(
+    "OG_count_table.tsv",
+    header = TRUE,
+    row.names = 1,
+    sep = "\t",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+)
+
+# 2. Format column names for italicized species names
+format_species_italic <- function(x) {
+    sapply(strsplit(x, "_"), function(y) {
+        paste0("italic('", substr(y[1], 1, 1), ". ", y[2], "')")
+    })
+}
+colnames(count_df) <- format_species_italic(colnames(count_df))
+
+# 3. Categorize counts into discrete levels
+count_cat <- cut(
+    as.matrix(count_df),
+    breaks = c(-0.1, 0, 2, 4, Inf),
+    labels = c("0", "1-2", "3-4", "5+"),
+    include.lowest = TRUE
+)
+
+# 4. Convert factor matrix to numeric
+count_cat_num <- matrix(
+    as.numeric(count_cat),
+    nrow = nrow(count_df),
+    ncol = ncol(count_df),
+    dimnames = list(rownames(count_df), colnames(count_df))
+)
+
+# 5. Define colors
+my_colors <- c(
+    "0"    = "#dafbf2",
+    "1-2"  = "#c9eafb",
+    "3-4"  = "#c9b4f4",
+    "5+"   = "#b5a4ff"
+)
+color_mapping <- setNames(my_colors, 1:4)
+
+# 6. Draw heatmap with smaller scale bar
+p <- pheatmap(
+    count_cat_num,
+    color = color_mapping,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    border_color = "white",
+    cellwidth = 45,        # slightly wider for rotated labels
+    cellheight = 22,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = NA,
+    legend_breaks = 1:4,
+    legend_labels = names(my_colors),
+    angle_col = 45,
+    labels_col = parse(text = colnames(count_df)),
+    fontsize = 14,          # overall font size
+    fontsize_row = 14,      # row names
+    fontsize_col = 14       # column names & legend labels
+)
+
+
+# save as PDF (vector format)
+pdf("heatmap_highres.pdf", width = 10, height = 6.7)
+grid.newpage()
+grid.draw(p$gtable)
+dev.off()
+
+
+
+### Flavonoid
+
+# -------------------------------
+# Heatmap with Italicized Species Names and Smaller Scale Bar
+# -------------------------------
+
+library(pheatmap)
+library(grid)
+
+# 1. Read TSV data
+count_df <- read.table(
+    "OG_count_table.tsv",
+    header = TRUE,
+    row.names = 1,
+    sep = "\t",
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+)
+
+# 2. Format column names for italicized species names
+format_species_italic <- function(x) {
+    sapply(strsplit(x, "_"), function(y) {
+        paste0("italic('", substr(y[1], 1, 1), ". ", y[2], "')")
+    })
+}
+colnames(count_df) <- format_species_italic(colnames(count_df))
+
+# 3. Categorize counts into discrete levels
+count_cat <- cut(
+    as.matrix(count_df),
+    breaks = c(-0.1, 0, 2, 4, Inf),
+    labels = c("0", "1-2", "3-4", "5+"),
+    include.lowest = TRUE
+)
+
+# 4. Convert factor matrix to numeric
+count_cat_num <- matrix(
+    as.numeric(count_cat),
+    nrow = nrow(count_df),
+    ncol = ncol(count_df),
+    dimnames = list(rownames(count_df), colnames(count_df))
+)
+
+# 5. Define colors
+my_colors <- c(
+    "0"    = "#dafbf2",
+    "1-2"  = "#c9eafb",
+    "3-4"  = "#c9b4f4",
+    "5+"   = "#b5a4ff"
+)
+color_mapping <- setNames(my_colors, 1:4)
+
+# 6. Draw heatmap with smaller scale bar
+p <- pheatmap(
+    count_cat_num,
+    color = color_mapping,
+    cluster_rows = FALSE,
+    cluster_cols = FALSE,
+    border_color = "white",
+    cellwidth = 45,        # slightly wider for rotated labels
+    cellheight = 22,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = NA,
+    legend_breaks = 1:4,
+    legend_labels = names(my_colors),
+    angle_col = 45,
+    labels_col = parse(text = colnames(count_df)),
+    fontsize = 14,          # overall font size
+    fontsize_row = 14,      # row names
+    fontsize_col = 14       # column names & legend labels
+)
+
+
+# save as PDF (vector format)
+pdf("heatmap_highres.pdf", width = 15, height = 25)
+grid.newpage()
+grid.draw(p$gtable)
+dev.off()
+
+
+#### EDTA, LAI, LTR insertion time 
+
+
+#### Run EDTA
+
+#!/bin/bash
+#SBATCH --job-name=EDTA
+#SBATCH --qos=xingbo.wu
+#SBATCH --time=10-00:00:00
+#SBATCH --cpus-per-task=44
+#SBATCH --mem=350G
+#SBATCH --array=0-2    # One job per genome
+
+module load edta/2.2.2
+
+# === List of genome FASTA files ===
+
+GENOMES=(
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_glandulifera.fasta
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_parviflora.fasta
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_noli-tangere.fasta
+)
+
+# === Select genome for this array task ===
+GENOME=${GENOMES[$SLURM_ARRAY_TASK_ID]}
+BASENAME=$(basename "$GENOME" .fasta)
+OUTDIR="/blue/xingbo.wu/jinli/impatiens/genus/EDTA/${BASENAME}_EDTA"
+
+mkdir -p "$OUTDIR"
+cd "$OUTDIR"
+
+echo ">>> Processing $GENOME"
+echo "    Using $SLURM_CPUS_PER_TASK threads"
+echo "    Output directory: $OUTDIR"
+
+# === Step 1: Run EDTA (sensitive mode) ===
+EDTA.pl \
+  --genome "$GENOME" \
+  --species others \
+  --step all \
+  --threads $SLURM_CPUS_PER_TASK \
+  --anno 1 \
+  --evaluate 1 \
+  --force 1
+
+# === Step 2: Define file paths ===
+GFF3="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.gff3"
+BED="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.struc.bed"
+PASSLIST="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.LTR.pass.list"
+RMOUT="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.out"
+
+# === Step 3: Generate BED from GFF3 ===
+if [[ ! -f "$BED" ]]; then
+    echo "Generating BED from GFF3..."
+    perl /apps/edta/2.2.2/share/EDTA/bin/gff2bed.pl "$GFF3" structural > "$BED"
+fi
+
+# === Step 4: Generate LTR pass list for LAI ===
+echo "Generating LTR pass list..."
+grep LTR "$BED" | grep struc | awk '{print $1":"$2".."$3"\t"$4}' > "$PASSLIST"
+
+if [[ ! -s "$PASSLIST" ]]; then
+    echo "Error: pass list is empty ($PASSLIST)"
+    exit 1
+fi
+
+# === Step 5: Ensure .out file exists ===
+if [[ ! -f "$RMOUT" ]]; then
+    echo "EDTA .out file not found, generating pseudo .out from BED..."
+    perl -nle 'my ($chr,$s,$e,$anno,$dir,$supfam) = (split)[0,1,2,3,8,12];
+               print "10000 0.001 0.001 0.001 $chr $s $e NA $dir $anno $supfam"' \
+        "$BED" > "$RMOUT"
+fi
+
+
+echo ">>> Finished processing $GENOME"
+
+
+#### LAI
+
+#!/bin/bash
+#SBATCH --job-name=LAI
+#SBATCH --qos=xingbo.wu-b
+#SBATCH --time=96:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=200G
+#SBATCH --array=0-2   # Adjust to number of genomes
+
+module load ltrretriever/2.9
+
+# === List of genome FASTA files ===
+GENOMES=(
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_glandulifera.fasta
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_noli-tangere.fasta
+/blue/xingbo.wu/jinli/impatiens/genus/EDTA/genome/Impatiens_parviflora.fasta
+)
+
+# === Select genome for this array task ===
+GENOME=${GENOMES[$SLURM_ARRAY_TASK_ID]}
+BASENAME=$(basename "$GENOME" .fasta)
+OUTDIR="/blue/xingbo.wu/jinli/impatiens/genus/EDTA/${BASENAME}_EDTA"
+
+PASSLIST="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.LTR.pass.list"
+GENOME_INPUT="$OUTDIR/${BASENAME}.fasta"
+RMOUT="${OUTDIR}/${BASENAME}.fasta.mod.EDTA.TEanno.out"
+
+mkdir -p ./LAI
+cd ./LAI
+
+echo "Running LAI for ${BASENAME}..."
+LAI -genome "$GENOME_INPUT" \
+    -intact "$PASSLIST" \
+    -all "$RMOUT" \
+    -t $SLURM_CPUS_PER_TASK -q
+
+
+#### LTR insertion time (Copia and Gypsy)
+ 
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+from matplotlib.patches import Patch
+
+# -----------------------------
+# Settings
+# -----------------------------
+GENOMES = [
+    "Impatiens_walleriana",
+    "Impatiens_noli-tangere",
+    "Impatiens_parviflora",
+    "Impatiens_glandulifera"
+]
+
+# Mapping for italicized labels (remove underscores)
+GENOME_LABELS = {
+    "Impatiens_glandulifera": r"$\it{Impatiens\ glandulifera}$",
+    "Impatiens_noli-tangere": r"$\it{Impatiens\ noli{-}tangere}$",
+    "Impatiens_parviflora": r"$\it{Impatiens\ parviflora}$",
+    "Impatiens_walleriana": r"$\it{Impatiens\ walleriana}$"
+}
+
+INPUT_DIR = "./"
+SUPERFAMILIES = ["LTR/Copia", "LTR/Gypsy"]
+palette = {"LTR/Copia": "#F8766D", "LTR/Gypsy": "#619CFF"}
+
+# -----------------------------
+# Read all genomes
+# -----------------------------
+all_data = []
+
+for genome in GENOMES:
+    file_path = os.path.join(INPUT_DIR, f"{genome}_EDTA_LTR_insertion_time.tsv")
+    if not os.path.exists(file_path):
+        print(f"Warning: file not found: {file_path}")
+        continue
+    df = pd.read_csv(file_path, sep="\t")
+    df = df[df["Superfamily"].isin(SUPERFAMILIES)]
+    df["InsertionTime_MYA"] = pd.to_numeric(df["InsertionTime_MYA"], errors='coerce')
+    df = df.dropna(subset=["InsertionTime_MYA"])
+    df["Genome"] = genome
+    all_data.append(df)
+
+if not all_data:
+    raise ValueError("No data found for the selected superfamilies in any genome.")
+
+combined_df = pd.concat(all_data, ignore_index=True)
+combined_df["Genome"] = pd.Categorical(combined_df["Genome"], categories=GENOMES, ordered=True)
+
+# -----------------------------
+# Plotting: stacked vertically, shared axes
+# -----------------------------
+sns.set(style="ticks")
+sns.set_context("talk", font_scale=0.8)
+bins = np.linspace(0, 5, 31)  # 30 bins from 0 to 5 MYA
+
+fig, axes = plt.subplots(
+    nrows=len(GENOMES),
+    ncols=1,
+    figsize=(6, 10),
+    sharex=True,
+    sharey=True
+)
+
+for ax, genome in zip(axes, GENOMES):
+    df = combined_df[combined_df["Genome"] == genome]
+    sns.histplot(
+        data=df,
+        x="InsertionTime_MYA",
+        hue="Superfamily",
+        bins=bins,
+        alpha=0.7,
+        stat="count",
+        element="bars",
+        edgecolor="white",
+        linewidth=0.8,
+        palette=palette,
+        ax=ax,
+        legend=False  # we will create a manual legend
+    )
+    ax.set_xlim(0, 3.5)
+    ax.set_title(GENOME_LABELS[genome], loc='left', fontsize=20)
+    ax.set_xlabel("")  # remove individual X-axis label
+    ax.set_ylabel("")  # remove individual Y-axis label
+    sns.despine(ax=ax)
+    ax.yaxis.set_visible(True)
+
+# -----------------------------
+# Manual legend
+# -----------------------------
+legend_handles = [Patch(facecolor=palette[sf], edgecolor='white', label=sf) for sf in SUPERFAMILIES]
+fig.legend(handles=legend_handles, title="", loc="upper right", frameon=False)
+
+# Shared axis labels
+fig.text(0.5, 0.04, "Insertion Time (Ma)", ha='center', fontsize=20)
+fig.text(0.04, 0.5, "Count", va='center', rotation='vertical', fontsize=20)
+
+plt.tight_layout(rect=[0.05, 0.05, 0.95, 0.95])
+plt.savefig("All_Genomes_LTR_insertion_time_count_shared_axes.png", dpi=2000)
+plt.show()
+
+
+#### KEGG background file generation
+
+for f in *.txt; do
+    awk '{
+        if (NF < 2) next;
+        gsub(/"/, "", $2);
+        if ($2 ~ /,/) {
+            n=split($2, a, ",");
+            for (i=1; i<=n; i++) print $1"\t"a[i];
+        } else {
+            print $1"\t"$2;
+        }
+    }' "$f" > "${f%.txt}.KO.fixed.txt"
+done
+
+cat *.KO.fixed.txt > all.KO.txt
